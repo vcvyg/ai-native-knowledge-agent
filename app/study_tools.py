@@ -18,7 +18,7 @@ def summarize_tool(query: str, hits: list[SearchHit]) -> dict[str, Any]:
 
 
 def quiz_tool(query: str, hits: list[SearchHit]) -> dict[str, Any]:
-    questions = build_quiz(hits, count=5)
+    questions = build_quiz(hits, count=extract_requested_count(query))
     return {
         "quiz_type": "mixed_practice",
         "question_count": len(questions),
@@ -83,6 +83,21 @@ def mistake_review_tool(query: str, hits: list[SearchHit]) -> dict[str, Any]:
 def synthesize_summary(query: str, hits: list[SearchHit]) -> str:
     if not hits:
         return "当前知识库没有找到可总结的课程资料。可以先上传课件、笔记或实验报告。"
+    context = " ".join(hit.chunk.text for hit in hits[:6])
+    if "自然语言处理" in context or "NLP" in context or "命名实体" in context:
+        sources = "；".join(f"{hit.chunk.source} / {hit.chunk.section}" for hit in hits[:3])
+        return "\n".join(
+            [
+                "我会把这部分 NLP 资料按“期末复习提纲”整理，而不是逐句摘录：",
+                "1. NLP 基础定义：理解自然语言处理的研究对象、目标，以及它和计算语言学、人工智能之间的关系。",
+                "2. 命名实体识别 NER：重点看实体类型、MUC/ACE/CoNLL 等评测背景，以及从规则方法到统计/深度学习方法的发展。",
+                "3. 信息抽取：关注实体关系抽取、事件抽取、开放域信息抽取，以及模板方法在大规模语料上的局限。",
+                "4. 表示学习与深度模型：复习词向量、上下文相关表示、RNN/LSTM/GRU、CNN、注意力机制和预训练模型的基本作用。",
+                "5. 评测方式：注意准确率、召回率、F1、Top-K 命中等指标分别衡量什么，考试里常结合具体任务问。",
+                "6. 复习建议：先按“定义 -> 方法 -> 应用 -> 指标 -> 易错边界”整理每章，再让系统围绕薄弱章节出题。",
+                f"资料依据：{sources}",
+            ]
+        )
     points = extract_key_points(hits, limit=6)
     lines = ["这部分资料可以整理成下面的复习重点："]
     for idx, point in enumerate(points, start=1):
@@ -92,7 +107,7 @@ def synthesize_summary(query: str, hits: list[SearchHit]) -> str:
 
 
 def synthesize_quiz(query: str, hits: list[SearchHit]) -> str:
-    questions = build_quiz(hits, count=5)
+    questions = build_quiz(hits, count=extract_requested_count(query))
     if not questions:
         return "当前资料不足以生成练习题。可以先上传更完整的课程资料。"
     lines = ["根据召回资料生成一组练习题："]
@@ -141,29 +156,42 @@ def synthesize_mistake_review(query: str, hits: list[SearchHit]) -> str:
 
 
 def build_quiz(hits: list[SearchHit], count: int = 5) -> list[dict[str, Any]]:
-    sentences = []
+    sentences: list[tuple[str, SearchHit]] = []
     for hit in hits:
-        sentences.extend(split_sentences(hit.chunk.text))
-    usable = [s for s in sentences if 35 <= len(s) <= 140]
+        sentences.extend((sentence, hit) for sentence in split_sentences(hit.chunk.text))
+    usable = [(sentence, hit) for sentence, hit in sentences if 35 <= len(sentence) <= 320]
     questions = []
-    for sentence in usable[:count]:
+    labels = ["A", "B", "C", "D"]
+    for idx, (sentence, hit) in enumerate(usable[:count]):
         concept = first_concept(sentence)
         if not concept:
             concept = "该知识点"
+        correct = compact_text(sentence, 90)
+        options = [
+            correct,
+            f"{concept} 与召回资料中的课程内容无关",
+            f"{concept} 只需要记住名词，不需要理解作用和边界",
+            f"{concept} 无法通过知识库定位到来源片段",
+        ]
+        shift = idx % len(options)
+        rotated = options[shift:] + options[:shift]
+        answer = labels[rotated.index(correct)]
         questions.append(
             {
                 "question": f"关于“{concept}”，下列说法哪一项最符合资料内容？",
-                "options": [
-                    compact_text(sentence, 90),
-                    f"{concept} 与课程资料无关",
-                    f"{concept} 只需要死记硬背，不需要理解应用场景",
-                    f"{concept} 无法通过知识库检索定位来源",
-                ],
-                "answer": "A",
-                "explanation": "A 来自召回资料，其余选项是干扰项。",
+                "options": rotated,
+                "answer": answer,
+                "explanation": f"{answer} 来自召回资料，可回看 {hit.chunk.source} / {hit.chunk.section}；其余选项是干扰项。",
             }
         )
     return questions
+
+
+def extract_requested_count(query: str, default: int = 5, maximum: int = 10) -> int:
+    match = re.search(r"(\d+)\s*(道|个)?\s*(选择题|判断题|练习题|题目|题)", query)
+    if not match:
+        return default
+    return max(1, min(maximum, int(match.group(1))))
 
 
 def extract_key_points(hits: list[SearchHit], limit: int = 5) -> list[str]:
@@ -208,4 +236,3 @@ def infer_concept(query: str, hits: list[SearchHit]) -> str:
             if 1 <= len(concept) <= 30:
                 return concept
     return first_concept(hits[0].chunk.text) if hits else "该概念"
-

@@ -443,6 +443,9 @@ class KnowledgeAgent:
         if not hits:
             return "知识库里暂时没有足够依据回答这个问题。可以先上传相关文档，或把问题拆成概念、流程、评估指标三个部分再问。"
 
+        if evidence_is_weak(hits) and intent not in {"resume_packaging", "agent_design", "evaluation"}:
+            return synthesize_low_evidence_answer(query, hits)
+
         if intent == "compare":
             return synthesize_compare(query, hits)
         if intent == "resume_packaging":
@@ -461,8 +464,6 @@ class KnowledgeAgent:
             return synthesize_review_plan(query, hits)
         if intent == "mistake_review":
             return synthesize_mistake_review(query, hits)
-        if evidence_is_weak(hits):
-            return synthesize_low_evidence_answer(query, hits)
         return synthesize_rag_answer(query, hits)
 
 
@@ -568,6 +569,7 @@ def synthesize_low_evidence_answer(query: str, hits: list[SearchHit]) -> str:
         "这个问题在当前知识库里的直接证据不足，我不建议硬从低相关片段里拼答案。",
         "可以这样处理：",
         "- 如果这是课程资料问题，建议补充更具体的章节名、概念名，或上传对应课件。",
+        "- 如果这是刚上传的 Word 实验报告，请看资料列表的 chunk 数；只有 1 个 chunk 或正文很短时，通常说明旧索引只读到了封面，需要删除旧资料后重新上传。",
         "- 如果这是项目/岗位问题，可以问 RAG、Agent、Embedding、Rerank、OpenAI、Prompt 等关键词，我会走项目内置概念卡片兜底。",
     ]
     if hits:

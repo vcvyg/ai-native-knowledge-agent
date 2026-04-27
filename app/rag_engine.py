@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 import time
 from dataclasses import asdict, dataclass
+from hashlib import sha1
 from pathlib import Path
 from typing import Any
 
@@ -231,7 +232,11 @@ def extract_title(text: str, file_path: Path) -> str:
 
 
 def stable_doc_id(file_path: Path) -> str:
-    return re.sub(r"[^a-zA-Z0-9]+", "-", file_path.stem).strip("-").lower()
+    slug = re.sub(r"[^\w\u4e00-\u9fff]+", "-", file_path.stem, flags=re.UNICODE)
+    slug = slug.strip("-_").lower()
+    if slug:
+        return slug
+    return f"doc-{sha1(file_path.name.encode('utf-8')).hexdigest()[:10]}"
 
 
 def split_sections(text: str) -> list[tuple[str, str]]:

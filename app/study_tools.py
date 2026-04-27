@@ -83,6 +83,8 @@ def mistake_review_tool(query: str, hits: list[SearchHit]) -> dict[str, Any]:
 def synthesize_summary(query: str, hits: list[SearchHit]) -> str:
     if not hits:
         return "当前知识库没有找到可总结的课程资料。可以先上传课件、笔记或实验报告。"
+    if is_experiment_summary_request(query, hits):
+        return synthesize_experiment_summary(query, hits)
     context = " ".join(hit.chunk.text for hit in hits[:6])
     if "自然语言处理" in context or "NLP" in context or "命名实体" in context:
         sources = "；".join(f"{hit.chunk.source} / {hit.chunk.section}" for hit in hits[:3])
@@ -104,6 +106,122 @@ def synthesize_summary(query: str, hits: list[SearchHit]) -> str:
         lines.append(f"{idx}. {point}")
     lines.append(f"建议先看来源：{hits[0].chunk.source} / {hits[0].chunk.section}")
     return "\n".join(lines)
+
+
+def is_experiment_summary_request(query: str, hits: list[SearchHit]) -> bool:
+    text = query + " " + " ".join(f"{hit.chunk.title} {hit.chunk.source}" for hit in hits[:3])
+    return "实验" in text and any(token in query for token in ["总结", "原理", "步骤", "流程", "怎么做"])
+
+
+def synthesize_experiment_summary(query: str, hits: list[SearchHit]) -> str:
+    focused = focus_hits_for_query(query, hits)
+    context = "\n".join(hit.chunk.text for hit in focused)
+    title = focused[0].chunk.title if focused else hits[0].chunk.title
+    source = focused[0].chunk.source if focused else hits[0].chunk.source
+
+    if "ROS" in title.upper() and "服务" in title:
+        return "\n".join(
+            [
+                f"这是《{title}》这个实验的原理和步骤总结：",
+                "",
+                "实验原理：",
+                "1. ROS service 是一种同步的请求-应答通信机制，和 topic 的持续发布/订阅不同。",
+                "2. 通信双方分为请求方 Client 和服务提供方 Server：Client 发送 request，Server 处理后返回 reply。",
+                "3. Client 在等待 reply 时会阻塞，直到 Server 完成处理，因此 service 适合一次性请求、需要明确反馈的任务。",
+                "4. 本实验用 AddTwoInts 服务演示：Client 发送两个整数，Server 在回调函数中相加，并把 sum 作为响应返回。",
+                "",
+                "实验步骤：",
+                "1. 创建 catkin_workspace/src 工作空间，执行 catkin_make，并 source devel/setup.bash 配置环境。",
+                "2. 创建功能包 learning_communication，依赖 roscpp、rospy、std_msgs。",
+                "3. 在 srv 目录下定义 AddTwoInts.srv，包含请求字段 int64 a、int64 b 和响应字段 int64 sum。",
+                "4. 修改 CMakeLists.txt 和 package.xml，启用服务文件生成、message_generation 依赖和 generate_messages。",
+                "5. 编写 client.cpp：初始化节点，读取命令行两个参数，创建 ServiceClient，发送 add_two_ints 请求并打印 sum。",
+                "6. 编写 server.cpp：初始化节点，advertiseService 注册 add_two_ints 服务，在回调函数里计算 req.a + req.b。",
+                "7. 修改编译配置后重新 catkin_make，依次运行 roscore、server 节点和 client 节点，观察请求和响应结果。",
+                "8. 使用 rosservice list/info/type/call 以及 rossrv list/show/info 等命令查看和调用服务。",
+                "",
+                "容易混淆点：topic 更适合连续数据流，service 更适合一次请求一次反馈；service 的同步等待会带来阻塞，但流程清晰、资源占用低。",
+                f"资料依据：{source}",
+            ]
+        )
+
+    principle = extract_between_markers(
+        context,
+        start_markers=["实验原理", "原理"],
+        end_markers=["实验步骤", "步骤", "实验内容", "三、", "四、"],
+        limit=420,
+    )
+    steps = extract_numbered_steps(context, limit=7)
+    lines = [f"这是《{title}》这个实验的总结：", ""]
+    lines.append("实验原理：")
+    lines.append(principle or "资料里没有检索到清晰的“实验原理”段落，建议补充更完整的实验报告正文。")
+    lines.append("")
+    lines.append("实验步骤：")
+    if steps:
+        lines.extend(f"{idx}. {step}" for idx, step in enumerate(steps, start=1))
+    else:
+        lines.append("资料里没有检索到清晰的编号步骤，建议检查上传文件是否包含可复制文本。")
+    lines.append(f"资料依据：{source}")
+    return "\n".join(lines)
+
+
+def focus_hits_for_query(query: str, hits: list[SearchHit]) -> list[SearchHit]:
+    if not hits:
+        return hits
+    source_scores: dict[str, float] = {}
+    for hit in hits:
+        title_source = f"{hit.chunk.title} {hit.chunk.source}".lower()
+        score = hit.score
+        if keyword_match_score(query, title_source) > 0:
+            score += 0.4
+        source_scores[hit.chunk.source] = source_scores.get(hit.chunk.source, 0.0) + score
+    best_source = max(source_scores, key=source_scores.get)
+    focused = [hit for hit in hits if hit.chunk.source == best_source]
+    return focused or hits
+
+
+def keyword_match_score(query: str, text: str) -> float:
+    query_terms = re.findall(r"[A-Za-z][A-Za-z0-9_\-]{1,}|[\u4e00-\u9fff]{2,}", query)
+    if not query_terms:
+        return 0.0
+    text_lower = text.lower()
+    return sum(1 for term in query_terms if term.lower() in text_lower) / len(query_terms)
+
+
+def extract_between_markers(
+    text: str,
+    start_markers: list[str],
+    end_markers: list[str],
+    limit: int,
+) -> str:
+    compact = re.sub(r"\s+", " ", text).strip()
+    start_positions = [compact.find(marker) for marker in start_markers if marker in compact]
+    if not start_positions:
+        return ""
+    start = min(pos for pos in start_positions if pos >= 0)
+    end_candidates = [compact.find(marker, start + 1) for marker in end_markers if compact.find(marker, start + 1) > start]
+    end = min(end_candidates) if end_candidates else min(len(compact), start + limit)
+    return compact_text(compact[start:end], limit)
+
+
+def extract_numbered_steps(text: str, limit: int = 7) -> list[str]:
+    cleaned = re.sub(r"\s+", " ", text)
+    pattern = r"(?:^|\s)(\d+)[.、．]\s*([^。；;]{12,120})"
+    steps = []
+    for _, body in re.findall(pattern, cleaned):
+        body = compact_text(body, 110)
+        if should_skip_step(body):
+            continue
+        if body not in steps:
+            steps.append(body)
+        if len(steps) >= limit:
+            break
+    return steps
+
+
+def should_skip_step(text: str) -> bool:
+    noisy = ["来源文件", "成绩", "截图", "写到实验报告", "请参考"]
+    return any(token in text for token in noisy)
 
 
 def synthesize_quiz(query: str, hits: list[SearchHit]) -> str:

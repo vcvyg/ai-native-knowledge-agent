@@ -69,6 +69,61 @@ class SessionMemory:
         return ""
 
 
+LOW_EVIDENCE_SCORE = 0.055
+
+CONCEPT_CARDS: dict[str, dict[str, Any]] = {
+    "rag": {
+        "title": "RAG（检索增强生成）",
+        "aliases": ["rag", "检索增强生成", "retrieval augmented generation"],
+        "definition": "RAG 是把外部知识库检索结果放进大模型上下文，再让模型基于资料生成回答的方法。",
+        "system_role": "在本项目里，RAG 负责资料解析、chunk 切分、召回、重排、引用来源和答案生成，是课程资料问答的主链路。",
+        "interview": "面试时可以强调它降低幻觉、支持私有资料问答，并且可以通过 Top-K 命中率、引用覆盖率和答案忠实度评估效果。",
+    },
+    "agent": {
+        "title": "Agent（智能体）",
+        "aliases": ["agent", "智能体", "ai agent"],
+        "definition": "Agent 是能根据目标判断下一步动作，并调用工具完成任务的应用架构。",
+        "system_role": "在本项目里，Agent 不是复杂多智能体，而是 Router + Tool 的轻量架构：先识别问答、总结、出题、复习计划等意图，再调用对应工具。",
+        "interview": "这种设计可控、可解释、容易落地，适合课程学习场景，也贴合 AI 原生工程师岗位对 Tool Use、Planning、Memory 的要求。",
+    },
+    "embedding": {
+        "title": "Embedding（向量表示）",
+        "aliases": ["embedding", "embeddings", "向量", "词向量", "语义向量", "嵌入"],
+        "definition": "Embedding 是把文本映射成向量，使语义相近的内容在向量空间中距离更近。",
+        "system_role": "在本项目里，它对应知识库检索层：上传资料被切成 chunk 后向量化，用户问题也向量化，然后做相似度召回。",
+        "interview": "可以说当前 demo 用 TF-IDF 模拟本地向量检索，工程接口保留为可替换形态，后续能换成 bge、OpenAI embedding、Chroma、FAISS 或 Milvus。",
+    },
+    "rerank": {
+        "title": "Rerank（重排）",
+        "aliases": ["rerank", "重排", "二次排序", "重排序"],
+        "definition": "Rerank 是对初次召回的候选片段重新排序，把更能回答问题的上下文排到前面。",
+        "system_role": "在本项目里，Rerank 融合向量分、关键词覆盖、标题/章节命中和结构加权，减少只靠相似度带来的跑偏。",
+        "interview": "可以强调向量召回负责“广撒网”，Rerank 负责“精排序”，两者配合提升答案相关性。",
+    },
+    "llm": {
+        "title": "LLM（大语言模型）",
+        "aliases": ["llm", "大模型", "大语言模型", "deepseek", "qwen", "通义", "混元"],
+        "definition": "LLM 负责理解用户问题、组织语言和生成自然语言回答。",
+        "system_role": "在本项目里，LLM 是可选适配层：没有 API Key 时走本地 synthesizer，有 OpenAI-compatible API 时可切换真实模型生成。",
+        "interview": "这能体现工程解耦：检索、路由和工具链不依赖某一家模型服务，部署时可按成本和效果切换供应商。",
+    },
+    "openai": {
+        "title": "OpenAI",
+        "aliases": ["openai", "gpt", "chatgpt"],
+        "definition": "OpenAI 是提供 GPT 系列大模型、Embedding、语音、多模态等 AI API 的公司和平台。",
+        "system_role": "在本项目里，OpenAI 可以作为可选 LLM/Embedding 提供方，用于答案生成、语义向量化或后续评估。",
+        "interview": "如果面试官问到 OpenAI，可以把它放在“可插拔模型供应商”角度讲，而不是把项目绑定到某一个平台。",
+    },
+    "prompt": {
+        "title": "Prompt 工程",
+        "aliases": ["prompt", "提示词", "prompt engineering", "提示词工程"],
+        "definition": "Prompt 工程是设计输入格式、约束、示例和输出结构，让模型更稳定完成任务的方法。",
+        "system_role": "在本项目里，不同工具会使用不同回答策略，例如问答强调依据和引用，总结强调复习重点，出题强调题干、选项、答案和解析。",
+        "interview": "可以强调你不是只写一句 prompt，而是把任务拆成路由、检索、工具调用和结构化生成多个环节。",
+    },
+}
+
+
 class CapabilityRouter:
     def __init__(self) -> None:
         self.cards = [
@@ -133,33 +188,32 @@ class CapabilityRouter:
         card = self.cards[best_idx]
 
         lowered = query.lower()
-        if any(token in lowered for token in ["vs", "区别", "对比", "比较"]):
-            card = next(c for c in self.cards if c["intent"] == "compare")
+
+        def select(intent: str) -> None:
+            nonlocal card, best_idx
+            card = next(c for c in self.cards if c["intent"] == intent)
             best_idx = self.cards.index(card)
-        elif any(token in query for token in ["总结", "重点", "归纳", "提纲", "复习重点"]):
-            card = next(c for c in self.cards if c["intent"] == "summarize")
-            best_idx = self.cards.index(card)
-        elif any(token in query for token in ["出题", "选择题", "判断题", "练习题", "测验", "自测"]):
-            card = next(c for c in self.cards if c["intent"] == "quiz_generation")
-            best_idx = self.cards.index(card)
+
+        if any(token in lowered for token in ["vs", "区别", "对比", "比较", "异同", "差别"]):
+            select("compare")
+        elif re.search(r"(出|生成|来)\s*\d*\s*(道|个)?\s*(选择题|判断题|练习题|题目|quiz)", lowered) or any(
+            token in query for token in ["出题", "选择题", "判断题", "练习题", "测验", "自测"]
+        ):
+            select("quiz_generation")
+        elif any(token in query for token in ["总结", "重点", "归纳", "提纲", "复习重点", "梳理"]):
+            select("summarize")
         elif any(token in query for token in ["复习计划", "学习计划", "备考", "时间表", "学习路径"]):
-            card = next(c for c in self.cards if c["intent"] == "review_plan")
-            best_idx = self.cards.index(card)
+            select("review_plan")
         elif any(token in query for token in ["错题", "错了", "薄弱", "巩固", "回顾"]):
-            card = next(c for c in self.cards if c["intent"] == "mistake_review")
-            best_idx = self.cards.index(card)
-        elif any(token in query for token in ["解释", "是什么", "怎么理解", "定义"]):
-            card = next(c for c in self.cards if c["intent"] == "concept_explain")
-            best_idx = self.cards.index(card)
-        elif any(token in query for token in ["简历", "岗位", "面试", "负责"]):
-            card = next(c for c in self.cards if c["intent"] == "resume_packaging")
-            best_idx = self.cards.index(card)
-        elif any(token in query for token in ["评估", "指标", "效果", "准确", "命中"]):
-            card = next(c for c in self.cards if c["intent"] == "evaluation")
-            best_idx = self.cards.index(card)
-        elif any(token in query for token in ["链路", "架构", "工具调用", "执行流程", "怎么运行"]):
-            card = next(c for c in self.cards if c["intent"] == "agent_design")
-            best_idx = self.cards.index(card)
+            select("mistake_review")
+        elif any(token in query for token in ["简历", "岗位", "面试", "负责", "腾讯", "校招", "jd"]):
+            select("resume_packaging")
+        elif any(token in query for token in ["评估", "指标", "效果", "准确", "命中", "召回率", "幻觉"]):
+            select("evaluation")
+        elif any(token in query for token in ["链路", "架构", "工具调用", "执行流程", "怎么运行", "模块"]):
+            select("agent_design")
+        elif any(token in query for token in ["解释", "是什么", "什么是", "怎么理解", "定义", "原理", "作用"]) or detect_concept_card(query):
+            select("concept_explain")
 
         return card["intent"], list(card["tools"]), float(scores[best_idx])
 
@@ -190,11 +244,11 @@ class OptionalLLMClient:
             "messages": [
                 {
                     "role": "system",
-                    "content": "你是企业知识库 Agent，回答必须基于给定资料，无法确认时说明缺口。",
+                    "content": "你是课程资料知识库 Agent。优先基于给定资料回答；如果资料不相关或证据不足，要明确说明缺口。对 RAG、Agent、Embedding、OpenAI 等通用项目概念，可以补充通用解释，但必须标明这部分不是上传资料直接证据。",
                 },
                 {
                     "role": "user",
-                    "content": f"问题：{query}\n\n资料：\n{context}\n\n请给出结构化中文回答，并保留来源线索。",
+                    "content": f"问题：{query}\n\n资料：\n{context}\n\n请给出结构化中文回答：先给结论，再列关键依据和来源；不要把低相关资料硬解释成答案。",
                 },
             ],
             "temperature": 0.2,
@@ -249,6 +303,20 @@ class KnowledgeAgent:
                         latency_ms=0,
                     )
                 )
+            if evidence_is_weak(hits) and intent in {"summarize", "quiz_generation", "review_plan"}:
+                fallback_query = fallback_query_for_intent(intent, normalized_query)
+                fallback_hits = timed_call(
+                    trace,
+                    "fallback_retrieval",
+                    {
+                        "reason": "low_evidence",
+                        "original_top_score": round(hits[0].score, 4) if hits else 0.0,
+                        "query": fallback_query,
+                    },
+                    lambda: self.kb.search(fallback_query, top_k=top_k),
+                )
+                if fallback_hits and (not hits or fallback_hits[0].score > hits[0].score):
+                    hits = fallback_hits
 
         if "agent_planner" in tools:
             timed_call(
@@ -317,7 +385,13 @@ class KnowledgeAgent:
         answer = timed_call(
             trace,
             "answer_synthesizer",
-            {"intent": intent, "hits": len(hits), "llm_enabled": self.llm.enabled},
+            {
+                "intent": intent,
+                "hits": len(hits),
+                "top_score": round(hits[0].score, 4) if hits else 0.0,
+                "evidence_quality": "low" if evidence_is_weak(hits) else "ok",
+                "llm_enabled": self.llm.enabled,
+            },
             lambda: self._synthesize(normalized_query, intent, hits),
         )
 
@@ -329,6 +403,8 @@ class KnowledgeAgent:
             "latency_ms": int((time.perf_counter() - started) * 1000),
             "router_confidence": round(confidence, 4),
             "retrieved_chunks": len(hits),
+            "top_score": round(hits[0].score, 4) if hits else 0.0,
+            "evidence_quality": "low" if evidence_is_weak(hits) else "ok",
             "llm_mode": "openai_compatible" if self.llm.enabled else "local_synthesizer",
         }
         return AgentResponse(
@@ -360,6 +436,10 @@ class KnowledgeAgent:
         if llm_answer:
             return llm_answer
 
+        concept_card = detect_concept_card(query)
+        if concept_card and intent != "compare":
+            return synthesize_concept_card(query, concept_card, hits)
+
         if not hits:
             return "知识库里暂时没有足够依据回答这个问题。可以先上传相关文档，或把问题拆成概念、流程、评估指标三个部分再问。"
 
@@ -381,6 +461,8 @@ class KnowledgeAgent:
             return synthesize_review_plan(query, hits)
         if intent == "mistake_review":
             return synthesize_mistake_review(query, hits)
+        if evidence_is_weak(hits):
+            return synthesize_low_evidence_answer(query, hits)
         return synthesize_rag_answer(query, hits)
 
 
@@ -421,22 +503,100 @@ def summarize_tool_output(result: Any) -> dict[str, Any]:
     return {"value": result}
 
 
-def synthesize_rag_answer(query: str, hits: list[SearchHit]) -> str:
+def evidence_is_weak(hits: list[SearchHit]) -> bool:
+    return not hits or hits[0].score < LOW_EVIDENCE_SCORE
+
+
+def fallback_query_for_intent(intent: str, query: str) -> str:
+    if intent == "quiz_generation":
+        return f"{query} 自然语言处理 核心概念 模型 方法 评估 定义 原理"
+    if intent == "summarize":
+        return f"{query} 章节重点 核心概念 方法流程 应用场景"
+    if intent == "review_plan":
+        return f"{query} 复习重点 核心概念 典型题型 易错点"
+    return query
+
+
+def detect_concept_card(query: str) -> dict[str, Any] | None:
+    lowered = query.lower()
+    for card in CONCEPT_CARDS.values():
+        for alias in card["aliases"]:
+            alias_lower = alias.lower()
+            if alias_lower in lowered:
+                return card
+    return None
+
+
+def source_summary(hits: list[SearchHit], limit: int = 3) -> str:
+    useful = [hit for hit in hits[:limit] if hit.score >= LOW_EVIDENCE_SCORE]
+    if not useful:
+        return "资料命中：当前知识库没有检索到足够直接的片段，以下回答主要来自项目内置知识卡片。"
+    parts = [f"{hit.chunk.source} / {hit.chunk.section}" for hit in useful]
+    return "参考来源：" + "；".join(parts)
+
+
+def evidence_bullets(hits: list[SearchHit], limit: int = 3) -> list[str]:
     bullets = []
-    for hit in hits[:3]:
-        bullets.append(f"- {compact_text(hit.chunk.text, 170)}（来源：{hit.chunk.source}）")
-    return "基于知识库检索，可以这样回答：\n" + "\n".join(bullets)
+    seen: set[str] = set()
+    for hit in hits:
+        snippet = compact_text(hit.chunk.text, 150)
+        if snippet in seen:
+            continue
+        seen.add(snippet)
+        bullets.append(f"- {snippet}（来源：{hit.chunk.source} / {hit.chunk.section}）")
+        if len(bullets) >= limit:
+            break
+    return bullets
+
+
+def synthesize_concept_card(query: str, card: dict[str, Any], hits: list[SearchHit]) -> str:
+    lines = [
+        f"{card['title']}可以这样理解：",
+        f"- 是什么：{card['definition']}",
+        f"- 在本系统里的作用：{card['system_role']}",
+        f"- 面试表达：{card['interview']}",
+    ]
+    if hits and not evidence_is_weak(hits):
+        lines.append(f"- {source_summary(hits, limit=2)}")
+    else:
+        lines.append("- 说明：当前上传课程资料里没有足够直接的对应片段，所以这里使用项目内置概念卡片兜底，避免强行引用无关 chunk。")
+    return "\n".join(lines)
+
+
+def synthesize_low_evidence_answer(query: str, hits: list[SearchHit]) -> str:
+    lines = [
+        "这个问题在当前知识库里的直接证据不足，我不建议硬从低相关片段里拼答案。",
+        "可以这样处理：",
+        "- 如果这是课程资料问题，建议补充更具体的章节名、概念名，或上传对应课件。",
+        "- 如果这是项目/岗位问题，可以问 RAG、Agent、Embedding、Rerank、OpenAI、Prompt 等关键词，我会走项目内置概念卡片兜底。",
+    ]
+    if hits:
+        lines.append("低相关候选片段仅供定位，不作为强依据：")
+        lines.extend(evidence_bullets(hits, limit=2))
+    return "\n".join(lines)
+
+
+def synthesize_rag_answer(query: str, hits: list[SearchHit]) -> str:
+    if evidence_is_weak(hits):
+        return synthesize_low_evidence_answer(query, hits)
+    lines = [
+        "根据知识库里命中的资料，可以归纳为：",
+        f"- 直接回答：{compact_text(hits[0].chunk.text, 220)}",
+        "- 关键依据：",
+    ]
+    lines.extend(evidence_bullets(hits, limit=3))
+    lines.append(f"- {source_summary(hits, limit=3)}")
+    return "\n".join(lines)
 
 
 def synthesize_compare(query: str, hits: list[SearchHit]) -> str:
-    context = " ".join(hit.chunk.text for hit in hits[:4])
     if "rag" in query.lower() and "agent" in query.lower():
         return (
             "RAG 和 Agent 的关系可以这样理解：\n"
             "- RAG 解决“从哪里找依据”的问题，核心是文档切分、Embedding、召回、Rerank 和带引用生成。\n"
             "- Agent 解决“下一步做什么”的问题，核心是意图判断、工具选择、Planning、Memory 和执行链路追踪。\n"
             "- 在本项目里，Agent 会先判断问题类型，再调用 RAG 检索工具、对比工具或简历包装工具，所以 RAG 是 Agent 的一个关键工具。\n"
-            f"- 知识库依据：{compact_text(context, 160)}"
+            f"- {source_summary(hits, limit=2)}"
         )
     return synthesize_rag_answer(query, hits)
 

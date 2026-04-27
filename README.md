@@ -8,6 +8,8 @@
 - Document chunking, metadata extraction, TF-IDF semantic retrieval.
 - Hybrid retrieval: vector similarity + keyword overlap + title boost.
 - Rerank stage with section and query-term boosts.
+- Evidence-quality guard: low-confidence retrieval will not be forced into an answer.
+- Built-in AI-native concept notes for RAG, Agent, Embedding, Rerank, OpenAI and Prompt Engineering.
 - Learning Agent router with Tool Use style trace.
 - Study tools: course QA, summary, quiz generation, concept explanation, review plan, mistake review.
 - Session memory for follow-up questions.
@@ -44,4 +46,3 @@ Project name: AI 课程资料知识库 + 学习 Agent 系统
 Suggested summary:
 
 面向大学课程复习场景，构建支持课程资料上传、RAG 问答、知识点总结、自动出题和错题回顾的 AI 学习助手；设计 Router + Tool 的轻量级 Agent 架构，根据用户意图自动选择问答、总结、出题、概念解释、复习计划和错题回顾工具，并通过前端展示引用来源、召回分数、工具调用链路和响应延迟。
-

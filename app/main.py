@@ -3,8 +3,10 @@ from __future__ import annotations
 import base64
 import io
 import time
+import zipfile
 from pathlib import Path
 from typing import Any
+from xml.etree import ElementTree as ET
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -117,7 +119,13 @@ def upload_document(payload: DocumentUploadRequest) -> dict[str, Any]:
     body = f"# {title.strip()}\n\n来源文件：{payload.filename}\n\n{text.strip()}\n"
     target.write_text(body, encoding="utf-8")
     kb.load()
-    return {"success": True, "document": filename, "characters": len(text), "kb": kb.stats()}
+    return {
+        "success": True,
+        "document": filename,
+        "characters": len(text),
+        "warning": parse_quality_warning(payload.filename, text),
+        "kb": kb.stats(),
+    }
 
 
 @app.delete("/api/kb/documents/{doc_id}")
@@ -207,11 +215,69 @@ def extract_uploaded_text(filename: str, raw: bytes) -> str:
             raise ValueError(f"PDF 解析失败: {exc}") from exc
     if suffix == ".docx":
         try:
-            import docx
-
-            doc = docx.Document(io.BytesIO(raw))
-            return "\n".join(p.text for p in doc.paragraphs if p.text.strip())
+            return extract_docx_text(raw)
         except Exception as exc:
             raise ValueError(f"Word 解析失败: {exc}") from exc
     raise ValueError("暂只支持 PDF、DOCX、TXT、Markdown")
 
+
+def extract_docx_text(raw: bytes) -> str:
+    """Extract visible text from docx, including tables and text boxes.
+
+    python-docx's ``Document.paragraphs`` misses text inside tables, which is
+    common in Chinese university lab-report templates. Reading the WordprocessingML
+    paragraphs directly keeps those cells available for indexing.
+    """
+
+    blocks: list[str] = []
+    with zipfile.ZipFile(io.BytesIO(raw)) as archive:
+        names = [
+            "word/document.xml",
+            *sorted(n for n in archive.namelist() if n.startswith("word/header") and n.endswith(".xml")),
+            *sorted(n for n in archive.namelist() if n.startswith("word/footer") and n.endswith(".xml")),
+            *sorted(n for n in archive.namelist() if n in {"word/footnotes.xml", "word/endnotes.xml"}),
+        ]
+        for name in names:
+            if name not in archive.namelist():
+                continue
+            blocks.extend(extract_docx_xml_blocks(archive.read(name)))
+    return normalize_extracted_lines(blocks)
+
+
+def extract_docx_xml_blocks(xml_bytes: bytes) -> list[str]:
+    root = ET.fromstring(xml_bytes)
+    namespace = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
+    blocks: list[str] = []
+    for paragraph in root.findall(".//w:p", namespace):
+        parts: list[str] = []
+        for node in paragraph.iter():
+            tag = node.tag.rsplit("}", 1)[-1]
+            if tag == "t" and node.text:
+                parts.append(node.text)
+            elif tag == "tab":
+                parts.append(" ")
+            elif tag == "br":
+                parts.append("\n")
+        text = "".join(parts).strip()
+        if text:
+            blocks.append(text)
+    return blocks
+
+
+def normalize_extracted_lines(lines: list[str]) -> str:
+    cleaned: list[str] = []
+    previous = ""
+    for line in lines:
+        line = " ".join(part for part in line.replace("\t", " ").split() if part)
+        if not line or line == previous:
+            continue
+        cleaned.append(line)
+        previous = line
+    return "\n".join(cleaned)
+
+
+def parse_quality_warning(filename: str, text: str) -> str | None:
+    suffix = Path(filename).suffix.lower()
+    if suffix in {".docx", ".pdf"} and len(text.strip()) < 500:
+        return "解析出的正文偏短，可能源文件主要由图片、扫描件或特殊控件组成。建议检查资料列表 chunk 数，必要时另存为可复制文本后重新上传。"
+    return None

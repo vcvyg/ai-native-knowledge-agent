@@ -666,7 +666,9 @@
           });
           if (!response.ok) throw new Error(await response.text());
           const data = await response.json();
-          uploadStatus.textContent = `已加入知识库：${data.document}`;
+          uploadStatus.textContent = data.warning
+            ? `已加入知识库：${data.document}，但${data.warning}`
+            : `已加入知识库：${data.document}`;
           await loadHealth();
         } catch (error) {
           uploadStatus.textContent = "上传失败";

@@ -229,7 +229,15 @@ def first_concept(text: str) -> str:
 
 
 def infer_concept(query: str, hits: list[SearchHit]) -> str:
-    for pattern in [r"什么是(.+)", r"解释(.+)", r"(.+)是什么", r"(.+)怎么理解"]:
+    for pattern in [
+        r"(.+?)的实验原理",
+        r"(.+?)实验原理",
+        r"(.+?)的原理",
+        r"什么是(.+)",
+        r"解释(.+)",
+        r"(.+)是什么",
+        r"(.+)怎么理解",
+    ]:
         match = re.search(pattern, query)
         if match:
             concept = match.group(1).strip(" ？?。")

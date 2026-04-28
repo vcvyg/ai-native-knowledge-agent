@@ -441,7 +441,7 @@ class KnowledgeAgent:
             return llm_answer
 
         concept_card = detect_concept_card(query)
-        if concept_card and intent != "compare":
+        if concept_card and intent in {"rag_answer", "concept_explain"}:
             return synthesize_concept_card(query, concept_card, hits)
 
         if not hits:

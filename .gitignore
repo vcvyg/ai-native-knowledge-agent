@@ -9,6 +9,8 @@ env/
 *.log
 server.out.log
 server.err.log
+.tmp_*.pid
+.playwright-cli/
 data/vector_store/
 
 .env

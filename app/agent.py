@@ -299,7 +299,9 @@ class KnowledgeAgent:
                     ToolCall(
                         name="rerank",
                         input={"candidates": len(hits)},
-                        output={"strategy": "vector + keyword + title + section boost"},
+                        output={
+                            "strategy": f"{self.kb.stats()['vector_backend']} + keyword + title + section boost"
+                        },
                         latency_ms=0,
                     )
                 )
@@ -391,6 +393,7 @@ class KnowledgeAgent:
                 "top_score": round(hits[0].score, 4) if hits else 0.0,
                 "evidence_quality": "low" if evidence_is_weak(hits) else "ok",
                 "llm_enabled": self.llm.enabled,
+                "vector_backend": self.kb.stats()["vector_backend"],
             },
             lambda: self._synthesize(normalized_query, intent, hits),
         )
@@ -406,6 +409,7 @@ class KnowledgeAgent:
             "top_score": round(hits[0].score, 4) if hits else 0.0,
             "evidence_quality": "low" if evidence_is_weak(hits) else "ok",
             "llm_mode": "openai_compatible" if self.llm.enabled else "local_synthesizer",
+            "vector_backend": self.kb.stats()["vector_backend"],
         }
         return AgentResponse(
             session_id=sid,

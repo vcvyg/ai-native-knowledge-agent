@@ -9,6 +9,7 @@ env/
 *.log
 server.out.log
 server.err.log
+data/vector_store/
 
 .env
 .env.*

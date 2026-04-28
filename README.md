@@ -6,9 +6,9 @@
 
 ![Agent console](docs/assets/agent-console.png)
 
-## 适配岗位
+## 适配
 
-项目贴合 AI 原生工程师 / LLM 应用工程师 / RAG 应用开发岗位，覆盖常见 JD 关键词：
+关键词：
 
 - AI 应用产品设计与开发
 - RAG 知识库系统搭建

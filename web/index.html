@@ -582,6 +582,7 @@
           <div class="runtime" id="runtime">
             <div class="runtime-row"><span>Latency</span><strong>-</strong></div>
             <div class="runtime-row"><span>Retrieved</span><strong>-</strong></div>
+            <div class="runtime-row"><span>Vector DB</span><strong>-</strong></div>
             <div class="runtime-row"><span>LLM Mode</span><strong>-</strong></div>
           </div>
           <div class="section-title">Evidence</div>
@@ -769,6 +770,7 @@
           <div class="runtime-row"><span>Latency</span><strong>${data.metrics.latency_ms} ms</strong></div>
           <div class="runtime-row"><span>Retrieved</span><strong>${data.metrics.retrieved_chunks}</strong></div>
           <div class="runtime-row"><span>Router</span><strong>${data.metrics.router_confidence}</strong></div>
+          <div class="runtime-row"><span>Vector DB</span><strong>${escapeHtml(data.metrics.vector_backend)}</strong></div>
           <div class="runtime-row"><span>LLM Mode</span><strong>${escapeHtml(data.metrics.llm_mode)}</strong></div>
         `;
         citations.innerHTML = data.citations.map(renderCitation).join("");

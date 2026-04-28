@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import re
 import time
+import os
 from dataclasses import asdict, dataclass
 from hashlib import sha1
 from pathlib import Path
 from typing import Any
 
 import numpy as np
-from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.feature_extraction.text import HashingVectorizer, TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 
 
@@ -47,24 +48,164 @@ class SearchHit:
         return payload
 
 
-class KnowledgeBase:
-    """Small local RAG engine with hybrid retrieval and reranking.
+@dataclass
+class VectorCandidate:
+    chunk_index: int
+    vector_score: float
 
-    It intentionally avoids heavyweight vector database dependencies so the
-    project can run in a classroom or interview demo environment immediately.
-    The interface is kept close to a real vector store so FAISS, Chroma, Milvus,
-    or Elasticsearch can replace this class later.
-    """
 
-    def __init__(self, data_dir: Path):
-        self.data_dir = data_dir
-        self.chunks: list[Chunk] = []
+class TfidfVectorStore:
+    """Zero-config vector backend for local demos and CI."""
+
+    name = "tfidf_local"
+
+    def __init__(self) -> None:
         self._char_vectorizer: TfidfVectorizer | None = None
         self._word_vectorizer: TfidfVectorizer | None = None
         self._char_matrix = None
         self._word_matrix = None
+
+    def build(self, chunks: list[Chunk], index_views: list["_IndexView"]) -> None:
+        corpus = [view.text_for_index for view in index_views]
+        if not corpus:
+            self._char_vectorizer = None
+            self._word_vectorizer = None
+            self._char_matrix = None
+            self._word_matrix = None
+            return
+
+        self._char_vectorizer = TfidfVectorizer(
+            analyzer="char",
+            ngram_range=(2, 4),
+            min_df=1,
+            sublinear_tf=True,
+            norm="l2",
+        )
+        self._word_vectorizer = TfidfVectorizer(
+            analyzer="word",
+            token_pattern=r"(?u)\b[\w\-]+\b",
+            ngram_range=(1, 2),
+            lowercase=True,
+            min_df=1,
+            sublinear_tf=True,
+            norm="l2",
+        )
+        self._char_matrix = self._char_vectorizer.fit_transform(corpus)
+        self._word_matrix = self._word_vectorizer.fit_transform(corpus)
+
+    def search(self, query: str, top_n: int) -> list[VectorCandidate]:
+        if not self._char_vectorizer or self._char_matrix is None:
+            return []
+
+        q_char = self._char_vectorizer.transform([query])
+        char_scores = cosine_similarity(q_char, self._char_matrix).ravel()
+
+        if self._word_vectorizer and self._word_matrix is not None:
+            q_word = self._word_vectorizer.transform([query])
+            word_scores = cosine_similarity(q_word, self._word_matrix).ravel()
+        else:
+            word_scores = np.zeros(len(char_scores))
+
+        candidates = [
+            VectorCandidate(
+                chunk_index=idx,
+                vector_score=0.68 * float(char_scores[idx]) + 0.32 * float(word_scores[idx]),
+            )
+            for idx in range(len(char_scores))
+        ]
+        candidates.sort(key=lambda item: item.vector_score, reverse=True)
+        return candidates[:top_n]
+
+
+class ChromaVectorStore:
+    """Persistent vector database backend.
+
+    Chroma is used when ``AI_AGENT_VECTOR_BACKEND=chroma`` or when the default
+    ``auto`` mode finds chromadb installed. A fixed-size HashingVectorizer keeps
+    the backend self-contained for a student demo; swapping it for bge/OpenAI
+    embeddings only requires changing the embedding function here.
+    """
+
+    name = "chroma_hashing"
+
+    def __init__(self, persist_dir: Path):
+        self.persist_dir = persist_dir
+        self.collection = None
+        self.chunk_count = 0
+        self.vectorizer = HashingVectorizer(
+            analyzer="char_wb",
+            ngram_range=(2, 5),
+            n_features=768,
+            alternate_sign=False,
+            norm="l2",
+        )
+
+    def build(self, chunks: list[Chunk], index_views: list["_IndexView"]) -> None:
+        import chromadb
+
+        self.persist_dir.mkdir(parents=True, exist_ok=True)
+        client = chromadb.PersistentClient(path=str(self.persist_dir))
+        collection_name = "course_chunks"
+        try:
+            client.delete_collection(collection_name)
+        except Exception:
+            pass
+
+        self.collection = client.create_collection(
+            name=collection_name,
+            metadata={"hnsw:space": "cosine"},
+        )
+        self.chunk_count = len(chunks)
+        if not chunks:
+            return
+
+        corpus = [view.text_for_index for view in index_views]
+        embeddings = self.vectorizer.transform(corpus).toarray().astype("float32").tolist()
+        ids = [f"{chunk.id}-{idx}" for idx, chunk in enumerate(chunks)]
+        metadatas = [{"chunk_index": idx, "source": chunk.source} for idx, chunk in enumerate(chunks)]
+        self.collection.add(
+            ids=ids,
+            documents=corpus,
+            embeddings=embeddings,
+            metadatas=metadatas,
+        )
+
+    def search(self, query: str, top_n: int) -> list[VectorCandidate]:
+        if self.collection is None or self.chunk_count == 0:
+            return []
+
+        embedding = self.vectorizer.transform([query]).toarray().astype("float32")[0].tolist()
+        result = self.collection.query(
+            query_embeddings=[embedding],
+            n_results=min(top_n, self.chunk_count),
+            include=["distances", "metadatas"],
+        )
+        distances = result.get("distances", [[]])[0]
+        metadatas = result.get("metadatas", [[]])[0]
+        candidates: list[VectorCandidate] = []
+        for distance, metadata in zip(distances, metadatas):
+            chunk_index = int(metadata["chunk_index"])
+            vector_score = max(0.0, 1.0 - float(distance))
+            candidates.append(VectorCandidate(chunk_index=chunk_index, vector_score=vector_score))
+        return candidates
+
+
+class KnowledgeBase:
+    """Course-material RAG engine with swappable vector store backends."""
+
+    def __init__(self, data_dir: Path):
+        self.data_dir = data_dir
+        self.chunks: list[Chunk] = []
+        self.vector_store = self._select_vector_store()
+        self.vector_backend_error: str | None = None
         self.last_loaded_at = 0.0
         self.load()
+
+    def _select_vector_store(self):
+        preference = os.getenv("AI_AGENT_VECTOR_BACKEND", "auto").strip().lower()
+        if preference in {"auto", "chroma"}:
+            return ChromaVectorStore(self.data_dir.parent / "vector_store" / "chroma")
+        return TfidfVectorStore()
 
     def load(self) -> None:
         self.data_dir.mkdir(parents=True, exist_ok=True)
@@ -75,31 +216,14 @@ class KnowledgeBase:
             text = file_path.read_text(encoding="utf-8", errors="ignore")
             self.chunks.extend(chunk_document(file_path, text))
 
-        corpus = [c.text_for_index for c in _chunk_index_views(self.chunks)]
-        if corpus:
-            self._char_vectorizer = TfidfVectorizer(
-                analyzer="char",
-                ngram_range=(2, 4),
-                min_df=1,
-                sublinear_tf=True,
-                norm="l2",
-            )
-            self._word_vectorizer = TfidfVectorizer(
-                analyzer="word",
-                token_pattern=r"(?u)\b[\w\-]+\b",
-                ngram_range=(1, 2),
-                lowercase=True,
-                min_df=1,
-                sublinear_tf=True,
-                norm="l2",
-            )
-            self._char_matrix = self._char_vectorizer.fit_transform(corpus)
-            self._word_matrix = self._word_vectorizer.fit_transform(corpus)
-        else:
-            self._char_vectorizer = None
-            self._word_vectorizer = None
-            self._char_matrix = None
-            self._word_matrix = None
+        index_views = _chunk_index_views(self.chunks)
+        try:
+            self.vector_backend_error = None
+            self.vector_store.build(self.chunks, index_views)
+        except Exception as exc:
+            self.vector_backend_error = f"{type(exc).__name__}: {exc}"
+            self.vector_store = TfidfVectorStore()
+            self.vector_store.build(self.chunks, index_views)
         self.last_loaded_at = time.time()
 
     def stats(self) -> dict[str, Any]:
@@ -111,6 +235,8 @@ class KnowledgeBase:
             "sections": len(sections),
             "data_dir": str(self.data_dir),
             "last_loaded_at": self.last_loaded_at,
+            "vector_backend": self.vector_store.name,
+            "vector_backend_error": self.vector_backend_error,
         }
 
     def documents(self) -> list[dict[str, Any]]:
@@ -144,23 +270,30 @@ class KnowledgeBase:
         return None
 
     def search(self, query: str, top_k: int = 6) -> list[SearchHit]:
-        if not self.chunks or not self._char_vectorizer or self._char_matrix is None:
+        if not self.chunks:
             return []
 
         expanded_query = expand_query(query)
-        q_char = self._char_vectorizer.transform([expanded_query])
-        char_scores = cosine_similarity(q_char, self._char_matrix).ravel()
-
-        if self._word_vectorizer and self._word_matrix is not None:
-            q_word = self._word_vectorizer.transform([expanded_query])
-            word_scores = cosine_similarity(q_word, self._word_matrix).ravel()
-        else:
-            word_scores = np.zeros(len(self.chunks))
-
+        vector_candidates = self.vector_store.search(expanded_query, top_n=max(top_k * 4, 24))
+        candidate_scores = {
+            candidate.chunk_index: candidate.vector_score for candidate in vector_candidates
+        }
         query_terms = extract_terms(expanded_query)
-        hits: list[SearchHit] = []
+
+        # Keep exact terms in the candidate pool so IDs, names, and short
+        # professional nouns are not lost by pure vector similarity.
         for idx, chunk in enumerate(self.chunks):
-            vector_score = 0.68 * float(char_scores[idx]) + 0.32 * float(word_scores[idx])
+            keyword_score = keyword_overlap(query_terms, chunk.text)
+            title_score = title_overlap(query_terms, f"{chunk.title} {chunk.section}")
+            if keyword_score > 0 or title_score > 0:
+                candidate_scores.setdefault(idx, 0.0)
+
+        if not candidate_scores:
+            return []
+
+        hits: list[SearchHit] = []
+        for idx, vector_score in candidate_scores.items():
+            chunk = self.chunks[idx]
             keyword_score = keyword_overlap(query_terms, chunk.text)
             title_score = title_overlap(query_terms, f"{chunk.title} {chunk.section}")
             score = 0.72 * vector_score + 0.20 * keyword_score + 0.08 * title_score

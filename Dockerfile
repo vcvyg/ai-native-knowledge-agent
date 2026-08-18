@@ -1,4 +1,6 @@
-FROM python:3.11-slim
+# Keep in sync with CI (.github/workflows/ci.yml): the pinned numpy>=2.5
+# requires Python >= 3.12.
+FROM python:3.12-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \

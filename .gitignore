@@ -15,7 +15,6 @@ server.err.log
 .tmp_*.pid
 .playwright-cli/
 data/vector_store/
-.task_handoffs/
 
 .env
 .env.*

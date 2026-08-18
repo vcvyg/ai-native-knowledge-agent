@@ -139,21 +139,3 @@ JSONL 基线覆盖架构问答、Cross-Encoder 变更影响、Embedding 下载�
 后训练导出器会把 Graph Event、Tool Call、引用、Stop Reason 和可解释奖励写成显式轨迹；默认只训练助手回答与工具选择，屏蔽工具结果和检索证据。训练阶段划分见 [posttraining-roadmap.md](docs/posttraining-roadmap.md)。
 
 这是一组小规模、可复现的工程回归基线，不代表生产数据上的泛化效果。
-
-## 中断与延迟交接
-
-长任务因额度或外部资源中断时，先保存可恢复交接，不使用阻塞式 sleep：
-
-```bash
-python -m scripts.deferred_handoff save \
-  --objective "完成当前工程任务" \
-  --reason "quota unavailable" \
-  --delay-minutes 60 \
-  --completed "已完成的工作" \
-  --remaining "待完成的工作" \
-  --next-action "恢复后的第一条命令"
-
-python -m scripts.deferred_handoff ready
-```
-
-交接文件默认保存在被忽略的 `.task_handoffs/`，包含 Git 工作区快照并自动脱敏常见凭证。脚本只能判断计划恢复时间是否到达，不能自行感知额度恢复或唤醒 Codex。

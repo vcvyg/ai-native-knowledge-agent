@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install dependencies
+        run: python -m pip install -r requirements-dev.txt
+      - name: Compile
+        run: python -m compileall -q app scripts tests
+      - name: Lint
+        run: ruff check app scripts tests
+      - name: Type check
+        run: python -m mypy
+      - name: Test
+        env:
+          AI_AGENT_VECTOR_BACKEND: memory
+          AI_AGENT_EMBEDDING_PROVIDER: test
+          AI_AGENT_ALLOW_TEST_EMBEDDINGS: "1"
+          AI_AGENT_RERANKER: heuristic
+        run: python -m pytest
+      - name: Offline evaluation
+        env:
+          AI_AGENT_VECTOR_BACKEND: memory
+          AI_AGENT_EMBEDDING_PROVIDER: test
+          AI_AGENT_ALLOW_TEST_EMBEDDINGS: "1"
+          AI_AGENT_RERANKER: heuristic
+        run: python -m scripts.evaluate --output reports/evaluation-results.json

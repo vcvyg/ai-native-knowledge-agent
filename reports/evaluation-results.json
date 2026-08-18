@@ -1,0 +1,176 @@
+{
+  "summary": {
+    "cases": 6,
+    "passed": 6,
+    "pass_rate": 1.0,
+    "intent_accuracy": 1.0,
+    "source_hit_rate": 1.0,
+    "tool_accuracy": 1.0,
+    "evidence_gate_accuracy": 1.0,
+    "average_latency_ms": 40.17,
+    "p95_latency_ms": 49,
+    "average_retrieval_attempts": 1.17
+  },
+  "cases": [
+    {
+      "id": "agent-architecture",
+      "query": "解释这个系统的 State Graph、证据验证和工具调用链路",
+      "intent": "agent_design",
+      "intent_ok": true,
+      "source_ok": true,
+      "tools_ok": true,
+      "evidence_ok": true,
+      "latency_ms": 49,
+      "retrieval_attempts": 1,
+      "stop_reason": "evidence_sufficient",
+      "trace": [
+        "intent_router",
+        "hybrid_retrieval",
+        "rerank",
+        "evidence_verifier",
+        "agent_planner",
+        "answer_synthesizer"
+      ],
+      "citations": [
+        "00-system-architecture.md",
+        "02-incident-response-runbook.md"
+      ],
+      "passed": true
+    },
+    {
+      "id": "cross-encoder-impact",
+      "query": "分析将 Reranker 切换为 Cross-Encoder 会影响哪些模块、配置和回退路径",
+      "intent": "change_impact",
+      "intent_ok": true,
+      "source_ok": true,
+      "tools_ok": true,
+      "evidence_ok": true,
+      "latency_ms": 38,
+      "retrieval_attempts": 1,
+      "stop_reason": "evidence_sufficient",
+      "trace": [
+        "intent_router",
+        "hybrid_retrieval",
+        "rerank",
+        "evidence_verifier",
+        "impact_analysis",
+        "answer_synthesizer"
+      ],
+      "citations": [
+        "01-change-impact-playbook.md",
+        "04-change-request-cross-encoder.md"
+      ],
+      "passed": true
+    },
+    {
+      "id": "embedding-timeout",
+      "query": "服务启动时 Embedding 模型下载超时，给出证据化故障诊断和恢复步骤",
+      "intent": "incident_diagnosis",
+      "intent_ok": true,
+      "source_ok": true,
+      "tools_ok": true,
+      "evidence_ok": true,
+      "latency_ms": 38,
+      "retrieval_attempts": 1,
+      "stop_reason": "evidence_sufficient",
+      "trace": [
+        "intent_router",
+        "hybrid_retrieval",
+        "rerank",
+        "evidence_verifier",
+        "incident_triage",
+        "answer_synthesizer"
+      ],
+      "citations": [
+        "02-incident-response-runbook.md"
+      ],
+      "passed": true
+    },
+    {
+      "id": "pr-review",
+      "query": "审查 Cross-Encoder 变更的兼容性、错误处理和测试缺口",
+      "intent": "pr_review",
+      "intent_ok": true,
+      "source_ok": true,
+      "tools_ok": true,
+      "evidence_ok": true,
+      "latency_ms": 42,
+      "retrieval_attempts": 1,
+      "stop_reason": "evidence_sufficient",
+      "trace": [
+        "intent_router",
+        "hybrid_retrieval",
+        "rerank",
+        "evidence_verifier",
+        "pr_review",
+        "answer_synthesizer"
+      ],
+      "citations": [
+        "01-change-impact-playbook.md",
+        "03-pr-review-standard.md",
+        "04-change-request-cross-encoder.md"
+      ],
+      "passed": true
+    },
+    {
+      "id": "verification-plan",
+      "query": "为 Verification Loop 的低证据重试设计可执行验证计划和回滚检查",
+      "intent": "validation_plan",
+      "intent_ok": true,
+      "source_ok": true,
+      "tools_ok": true,
+      "evidence_ok": true,
+      "latency_ms": 33,
+      "retrieval_attempts": 1,
+      "stop_reason": "evidence_sufficient",
+      "trace": [
+        "intent_router",
+        "hybrid_retrieval",
+        "rerank",
+        "evidence_verifier",
+        "validation_plan",
+        "answer_synthesizer"
+      ],
+      "citations": [
+        "02-incident-response-runbook.md",
+        "03-pr-review-standard.md"
+      ],
+      "passed": true
+    },
+    {
+      "id": "missing-evidence",
+      "query": "财务结算服务发生重复扣款，结合生产日志给出根因和修复方案",
+      "intent": "incident_diagnosis",
+      "intent_ok": true,
+      "source_ok": true,
+      "tools_ok": true,
+      "evidence_ok": true,
+      "latency_ms": 41,
+      "retrieval_attempts": 2,
+      "stop_reason": "retrieval_retry_limit",
+      "trace": [
+        "intent_router",
+        "hybrid_retrieval",
+        "rerank",
+        "evidence_verifier",
+        "query_rewrite",
+        "hybrid_retrieval",
+        "rerank",
+        "evidence_verifier",
+        "incident_triage",
+        "answer_synthesizer"
+      ],
+      "citations": [
+        "02-incident-response-runbook.md",
+        "03-pr-review-standard.md"
+      ],
+      "passed": true
+    }
+  ],
+  "configuration": {
+    "vector_backend": "dense_memory:sentence_transformers:BAAI/bge-small-zh-v1.5",
+    "embedding_model": "sentence_transformers:BAAI/bge-small-zh-v1.5",
+    "embedding_dimensions": 512,
+    "reranker": "heuristic"
+  }
+}

@@ -1,41 +1,40 @@
-# RAG + Agent 评估方案
+# Engineering Change Agent 评估方案
 
 ## 评估目标
 
-项目评估不只看“回答像不像”，而是拆成检索、生成、Agent 路由和工程性能四层，分别判断系统是否真的基于资料回答、是否选对工具、是否能稳定运行。
+评估拆成检索、答案证据、任务路由和工程性能四层，重点验证系统是否选对工程工具、命中对应材料、在证据不足时停止推断，并保留可诊断轨迹。
 
-## 评估用例
+## 基线用例
 
-| 场景 | 示例问题 | 期望工具链 | 主要指标 |
+| 场景 | 示例问题 | 期望工程工具 | 主要检查 |
 | --- | --- | --- | --- |
-| 课程问答 | 什么是 RAG，为什么能降低幻觉？ | intent_router -> hybrid_retrieval -> rerank -> answer_synthesizer | 引用覆盖率、答案忠实度 |
-| 资料总结 | 总结这份实验报告的原理和步骤 | intent_router -> hybrid_retrieval -> summarize_tool -> answer_synthesizer | 重点覆盖率、来源准确性 |
-| 自动出题 | 根据数据库事务出 5 道选择题 | intent_router -> hybrid_retrieval -> generate_quiz -> answer_synthesizer | 题目有效率、答案一致性 |
-| 概念解释 | 什么是 Embedding？ | intent_router -> hybrid_retrieval -> explain_concept -> answer_synthesizer | 定义准确率、例子相关性 |
-| 项目包装 | 这个项目怎么写进简历？ | intent_router -> hybrid_retrieval -> resume_tool -> answer_synthesizer | JD 关键词覆盖率 |
-| 追问记忆 | 刚才那个再讲讲难点 | memory -> intent_router -> hybrid_retrieval -> answer_synthesizer | 上下文一致性 |
+| 架构说明 | 解释 State Graph 与证据验证链路 | agent_planner | 来源、路径与停止条件 |
+| 变更影响 | Cross-Encoder 会影响哪些模块 | impact_analysis | 兼容性、资源、回退 |
+| 故障诊断 | Embedding 下载超时如何恢复 | incident_triage | 假设、证据、下一步 |
+| PR 审查 | 检查兼容性与测试缺口 | pr_review | 错误处理、幂等、回归 |
+| 验证计划 | 验证低证据重试与回滚 | validation_plan | baseline、oracle、故障注入 |
+| 域外问题 | 生产结算重复扣款根因 | evidence guard | 有界重试并拒绝编造 |
 
-## 指标设计
+## 指标
 
-- 检索层：Top-K Hit Rate、MRR、平均 Rerank Score、标题/章节命中率。
-- 生成层：Groundedness、Citation Coverage、Hallucination Rate、Low-evidence Block Rate。
-- Agent 层：Intent Accuracy、Tool Selection Accuracy、Average Tool Calls、Follow-up Recovery Rate。
-- 工程层：p50/p95 Latency、API Success Rate、Index Build Time、Upload Parse Success Rate。
+- 检索：Source Hit Rate、Top-K 命中、MRR、Rerank 分数。
+- 证据：Evidence Gate Accuracy、Citation Coverage、Groundedness、低证据拦截率。
+- Agent：Intent Accuracy、Tool Accuracy、平均检索次数、Stop Reason、Graph Path。
+- 工程：p50/p95 Latency、API 成功率、索引构建时间、失败恢复覆盖。
 
-## 当前已暴露的运行指标
+运行：
 
-前端 Runtime 面板已经展示：
+```bash
+python -m pytest
+python -m scripts.evaluate
+```
 
-- Latency：单次请求端到端耗时。
-- Retrieved：召回 chunk 数量。
-- Router：意图路由置信度。
-- Vector DB：实际使用的向量检索后端，例如 `chroma_hashing` 或 `tfidf_local`。
-- LLM Mode：当前是本地 synthesizer 还是 OpenAI-compatible 模型。
+自动评测结果由 `scripts.evaluate` 写入 `reports/evaluation-results.json`。当前 6 条用例只是一组可复现回归基线，不能解释为生产准确率；真实结果以该 JSON 文件的最新时间戳与模型元数据为准。
 
-## 后续实验计划
+## 扩展计划
 
-1. 构造 50-100 条课程资料问答集，覆盖定义、步骤、公式、对比、实验总结、简历包装等问题。
-2. 对比不同检索配置：TF-IDF、Chroma Hashing、bge embedding、Hybrid + Rerank。
-3. 统计 Top-K 命中率、引用覆盖率和低证据拦截率。
-4. 分析 Bad Case：误召回、跨文档串扰、低相关片段被强行总结、DOCX 表格解析缺失。
-5. 将评估结果写入报告，用作面试时解释系统迭代依据。
+1. 扩充到 50-100 条人工标注的变更、故障和审查样例。
+2. 对比 Dense Memory、Chroma 与 Cross-Encoder 配置的质量、延迟和资源。
+3. 增加错误日志、PR diff 和架构决策记录的解析器。
+4. 对低证据误放行、跨文档串扰、无效 Query Rewrite 和回退失真做 Bad Case 分析。
+5. 将评估结果版本化，作为发布门槛而不是展示数字。

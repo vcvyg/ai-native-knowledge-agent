@@ -1,4 +1,3 @@
 @echo off
-cd /d D:\ai-native-knowledge-agent
+cd /d "%~dp0"
 python -m uvicorn app.main:app --host 127.0.0.1 --port 8015 --reload
-

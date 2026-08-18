@@ -3,8 +3,11 @@ __pycache__/
 .Python
 
 .venv/
+.models/
 venv/
 env/
+.pytest_cache/
+.ruff_cache/
 
 *.log
 server.out.log
@@ -12,6 +15,7 @@ server.err.log
 .tmp_*.pid
 .playwright-cli/
 data/vector_store/
+.task_handoffs/
 
 .env
 .env.*

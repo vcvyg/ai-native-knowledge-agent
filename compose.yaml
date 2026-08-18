@@ -1,0 +1,14 @@
+services:
+  engineering-agent:
+    build: .
+    ports:
+      - "8015:8015"
+    environment:
+      AI_AGENT_VECTOR_BACKEND: ${AI_AGENT_VECTOR_BACKEND:-memory}
+      AI_AGENT_EMBEDDING_PROVIDER: ${AI_AGENT_EMBEDDING_PROVIDER:-sentence_transformers}
+      AI_AGENT_EMBEDDING_MODEL: ${AI_AGENT_EMBEDDING_MODEL:-BAAI/bge-small-zh-v1.5}
+      AI_AGENT_RERANKER: ${AI_AGENT_RERANKER:-heuristic}
+      AI_AGENT_MAX_RETRIEVAL_ATTEMPTS: ${AI_AGENT_MAX_RETRIEVAL_ATTEMPTS:-2}
+    volumes:
+      - ./data/knowledge_base:/app/data/knowledge_base
+    restart: unless-stopped

@@ -2,28 +2,33 @@ from __future__ import annotations
 
 import os
 import re
+import threading
 import time
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 import requests
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics.pairwise import cosine_similarity
 
-from .rag_engine import KnowledgeBase, SearchHit, compact_text
-from .study_tools import (
-    explain_tool,
-    mistake_review_tool,
-    quiz_tool,
-    review_plan_tool,
-    summarize_tool,
-    synthesize_explain,
-    synthesize_mistake_review,
-    synthesize_quiz,
-    synthesize_review_plan,
-    synthesize_summary,
+from .embeddings import EmbeddingProvider
+from .engineering_tools import (
+    evidence_summary_tool,
+    explain_component_tool,
+    impact_analysis_tool,
+    incident_triage_tool,
+    pr_review_tool,
+    runbook_tool,
+    synthesize_evidence_summary,
+    synthesize_explain_component,
+    synthesize_impact_analysis,
+    synthesize_incident_triage,
+    synthesize_pr_review,
+    synthesize_runbook,
+    synthesize_validation_plan,
+    validation_plan_tool,
 )
+from .rag_engine import KnowledgeBase, SearchHit, compact_text
+from .workflow import END, AgentState, GraphEvent, GraphRun, StateGraph
 
 
 @dataclass
@@ -43,6 +48,27 @@ class AgentResponse:
     trace: list[ToolCall]
     suggestions: list[str]
     metrics: dict[str, Any]
+
+
+@dataclass
+class DebugResponse:
+    run_id: str
+    status: str
+    next_node: str | None
+    breakpoints: list[str]
+    query: str
+    response: AgentResponse
+
+
+@dataclass
+class DebugCheckpoint:
+    run_id: str
+    session_id: str
+    query: str
+    top_k: int
+    breakpoints: set[str]
+    state: AgentState
+    run: GraphRun
 
 
 class SessionMemory:
@@ -69,98 +95,124 @@ class SessionMemory:
         return ""
 
 
-LOW_EVIDENCE_SCORE = 0.055
+def bounded_int_env(name: str, default: int, minimum: int, maximum: int) -> int:
+    """Read an integer setting without letting a malformed env break startup."""
+
+    try:
+        value = int(os.getenv(name, str(default)))
+    except ValueError:
+        value = default
+    return max(minimum, min(maximum, value))
+
+
+def bounded_float_env(name: str, default: float, minimum: float, maximum: float) -> float:
+    try:
+        value = float(os.getenv(name, str(default)))
+    except ValueError:
+        value = default
+    return max(minimum, min(maximum, value))
+
+
+LOW_EVIDENCE_SCORE = bounded_float_env(
+    "AI_AGENT_LOW_EVIDENCE_SCORE", default=0.20, minimum=0.0, maximum=1.0
+)
 
 CONCEPT_CARDS: dict[str, dict[str, Any]] = {
     "rag": {
         "title": "RAG（检索增强生成）",
         "aliases": ["rag", "检索增强生成", "retrieval augmented generation"],
         "definition": "RAG 是把外部知识库检索结果放进大模型上下文，再让模型基于资料生成回答的方法。",
-        "system_role": "在本项目里，RAG 负责资料解析、chunk 切分、召回、重排、引用来源和答案生成，是课程资料问答的主链路。",
-        "interview": "面试时可以强调它降低幻觉、支持私有资料问答，并且可以通过 Top-K 命中率、引用覆盖率和答案忠实度评估效果。",
+        "system_role": "在本系统里，RAG 为变更分析、故障诊断和 PR 审查提供仓库文档、日志与运行手册证据。",
+        "engineering": "质量不能只看回答是否流畅，还要验证 Top-K 命中、引用覆盖、答案忠实度与证据缺口。",
     },
     "agent": {
         "title": "Agent（智能体）",
         "aliases": ["agent", "智能体", "ai agent"],
         "definition": "Agent 是能根据目标判断下一步动作，并调用工具完成任务的应用架构。",
-        "system_role": "在本项目里，Agent 不是复杂多智能体，而是 Router + Tool 的轻量架构：先识别问答、总结、出题、复习计划等意图，再调用对应工具。",
-        "interview": "这种设计可控、可解释、容易落地，适合课程学习场景，也贴合 AI 原生工程师岗位对 Tool Use、Planning、Memory 的要求。",
+        "system_role": "在本项目里，Agent 由显式 State Graph 编排路由、检索、证据验证、查询改写、工具执行和答案生成；低证据时进入有界 Verification Loop。",
+        "engineering": "显式图把 Planning、Tool Use、Memory、失败恢复和停止条件落实为可观察、可测试的控制流。",
     },
     "embedding": {
         "title": "Embedding（向量表示）",
         "aliases": ["embedding", "embeddings", "向量", "词向量", "语义向量", "嵌入"],
         "definition": "Embedding 是把文本映射成向量，使语义相近的内容在向量空间中距离更近。",
-        "system_role": "在本项目里，它对应知识库检索层：上传资料被切成 chunk 后向量化，用户问题也向量化，然后做相似度召回。",
-        "interview": "可以说当前 demo 用 TF-IDF 模拟本地向量检索，工程接口保留为可替换形态，后续能换成 bge、OpenAI embedding、Chroma、FAISS 或 Milvus。",
+        "system_role": "在本项目里，文档和查询由 BAAI/bge-small-zh-v1.5 编码为真实稠密向量，再通过内存余弦检索或 Chroma 持久化索引召回。",
+        "engineering": "Embedding Provider 与向量存储解耦，并暴露模型名、向量维度和实际后端，便于诊断索引不兼容。",
     },
     "rerank": {
         "title": "Rerank（重排）",
         "aliases": ["rerank", "重排", "二次排序", "重排序"],
         "definition": "Rerank 是对初次召回的候选片段重新排序，把更能回答问题的上下文排到前面。",
         "system_role": "在本项目里，Rerank 融合向量分、关键词覆盖、标题/章节命中和结构加权，减少只靠相似度带来的跑偏。",
-        "interview": "可以强调向量召回负责“广撒网”，Rerank 负责“精排序”，两者配合提升答案相关性。",
+        "engineering": "向量召回负责扩大候选集合，Rerank 负责精排；可选模型失败时必须保留错误并安全回退。",
     },
     "llm": {
         "title": "LLM（大语言模型）",
         "aliases": ["llm", "大模型", "大语言模型", "deepseek", "qwen", "通义", "混元"],
         "definition": "LLM 负责理解用户问题、组织语言和生成自然语言回答。",
         "system_role": "在本项目里，LLM 是可选适配层：没有 API Key 时走本地 synthesizer，有 OpenAI-compatible API 时可切换真实模型生成。",
-        "interview": "这能体现工程解耦：检索、路由和工具链不依赖某一家模型服务，部署时可按成本和效果切换供应商。",
+        "engineering": "检索、路由和工具链不绑定单一模型供应商，部署时可按质量、延迟、成本和合规要求切换。",
     },
     "openai": {
         "title": "OpenAI",
         "aliases": ["openai", "gpt", "chatgpt"],
         "definition": "OpenAI 是提供 GPT 系列大模型、Embedding、语音、多模态等 AI API 的公司和平台。",
         "system_role": "在本项目里，OpenAI 可以作为可选 LLM/Embedding 提供方，用于答案生成、语义向量化或后续评估。",
-        "interview": "如果面试官问到 OpenAI，可以把它放在“可插拔模型供应商”角度讲，而不是把项目绑定到某一个平台。",
+        "engineering": "OpenAI 在这里是可插拔模型供应商之一，不是工作流、证据层或调试能力的前提。",
     },
     "prompt": {
         "title": "Prompt 工程",
         "aliases": ["prompt", "提示词", "prompt engineering", "提示词工程"],
         "definition": "Prompt 工程是设计输入格式、约束、示例和输出结构，让模型更稳定完成任务的方法。",
-        "system_role": "在本项目里，不同工具会使用不同回答策略，例如问答强调依据和引用，总结强调复习重点，出题强调题干、选项、答案和解析。",
-        "interview": "可以强调你不是只写一句 prompt，而是把任务拆成路由、检索、工具调用和结构化生成多个环节。",
+        "system_role": "不同工程工具使用不同输出约束：影响分析强调依赖与兼容性，故障诊断强调假设与证据，验证计划强调 oracle 与回滚。",
+        "engineering": "Prompt 只负责局部任务约束，稳定性还依赖路由、检索、状态图、工具协议和停止条件。",
     },
 }
 
 
 class CapabilityRouter:
-    def __init__(self) -> None:
-        self.cards = [
+    def __init__(self, embeddings: EmbeddingProvider) -> None:
+        self.embeddings = embeddings
+        self.cards: list[dict[str, Any]] = [
             {
-                "intent": "rag_answer",
-                "tools": ["hybrid_retrieval", "rerank", "answer_synthesizer"],
-                "description": "课程问答 文档问答 知识库 资料查询 RAG 引用来源 根据上下文回答",
+                "intent": "repository_qa",
+                "tools": ["hybrid_retrieval", "rerank", "explain_component", "answer_synthesizer"],
+                "description": "仓库问答 架构文档 组件职责 代码证据 配置 依赖 调用关系 根据上下文回答",
             },
             {
-                "intent": "summarize",
-                "tools": ["hybrid_retrieval", "rerank", "summarize_tool", "answer_synthesizer"],
-                "description": "总结 重点 复习 提纲 章节归纳 课程资料 知识点整理",
+                "intent": "evidence_summary",
+                "tools": ["hybrid_retrieval", "rerank", "evidence_summary", "answer_synthesizer"],
+                "description": "总结证据 变更摘要 归纳工程资料 提炼事实 证据地图 范围边界",
             },
             {
-                "intent": "quiz_generation",
-                "tools": ["hybrid_retrieval", "rerank", "generate_quiz", "answer_synthesizer"],
-                "description": "出题 选择题 判断题 练习题 测验 自测 根据资料生成题目",
+                "intent": "change_impact",
+                "tools": ["hybrid_retrieval", "rerank", "impact_analysis", "answer_synthesizer"],
+                "description": "变更影响 影响面 下游调用 兼容性 breaking change 配置 数据 状态 依赖 风险",
             },
             {
-                "intent": "concept_explain",
-                "tools": ["hybrid_retrieval", "rerank", "explain_concept", "answer_synthesizer"],
-                "description": "解释概念 是什么 怎么理解 定义 原理 例子 易错点",
+                "intent": "incident_diagnosis",
+                "tools": ["hybrid_retrieval", "rerank", "incident_triage", "answer_synthesizer"],
+                "description": "线上故障 报错 日志 根因 排查 timeout OOM 初始化失败 重试 异常 恢复",
             },
             {
-                "intent": "review_plan",
-                "tools": ["hybrid_retrieval", "rerank", "make_review_plan", "answer_synthesizer"],
-                "description": "复习计划 学习计划 备考安排 时间表 学习路径",
+                "intent": "pr_review",
+                "tools": ["hybrid_retrieval", "rerank", "pr_review", "answer_synthesizer"],
+                "description": "PR 审查 code review 风险 兼容性 测试缺口 回归 错误处理 安全 代码变更",
             },
             {
-                "intent": "mistake_review",
-                "tools": ["hybrid_retrieval", "rerank", "mistake_review", "answer_synthesizer"],
-                "description": "错题 错题本 薄弱点 回顾 继续追问 相似题 巩固",
+                "intent": "validation_plan",
+                "tools": ["hybrid_retrieval", "rerank", "validation_plan", "answer_synthesizer"],
+                "description": "验证计划 测试方案 复现步骤 验收标准 oracle 故障注入 回归测试 如何证明",
+            },
+            {
+                "intent": "runbook_generation",
+                "tools": ["hybrid_retrieval", "rerank", "runbook", "answer_synthesizer"],
+                "description": "运行手册 runbook 发布 上线 回滚 值班 SOP 扩量 检查清单 应急处置",
             },
             {
                 "intent": "agent_design",
                 "tools": ["agent_planner", "hybrid_retrieval", "rerank", "answer_synthesizer"],
-                "description": "Agent 智能体 Tool Use Planning Memory 工具调用 任务规划 多轮记忆 架构设计",
+                "description": "Agent 智能体 State Graph Tool Use Planning Memory 工具调用 任务规划 执行链路 架构设计",
             },
             {
                 "intent": "compare",
@@ -168,22 +220,16 @@ class CapabilityRouter:
                 "description": "对比 区别 vs 优缺点 RAG Agent Embedding 向量数据库 Rerank",
             },
             {
-                "intent": "resume_packaging",
-                "tools": ["hybrid_retrieval", "rerank", "resume_tool", "answer_synthesizer"],
-                "description": "简历 岗位匹配 项目亮点 负责内容 技术栈 腾讯校招 AI原生工程师",
-            },
-            {
                 "intent": "evaluation",
                 "tools": ["hybrid_retrieval", "rerank", "evaluation_tool", "answer_synthesizer"],
                 "description": "评估 指标 命中率 准确率 召回率 延迟 实验结果 RAGAS 测试集",
             },
         ]
-        self.vectorizer = TfidfVectorizer(analyzer="char", ngram_range=(2, 4))
-        self.matrix = self.vectorizer.fit_transform([c["description"] for c in self.cards])
+        self.matrix = self.embeddings.encode_documents([c["description"] for c in self.cards])
 
     def route(self, query: str) -> tuple[str, list[str], float]:
-        q_vec = self.vectorizer.transform([query])
-        scores = cosine_similarity(q_vec, self.matrix).ravel()
+        q_vec = self.embeddings.encode_queries([query])[0]
+        scores = self.matrix @ q_vec
         best_idx = int(scores.argmax())
         card = self.cards[best_idx]
 
@@ -194,26 +240,26 @@ class CapabilityRouter:
             card = next(c for c in self.cards if c["intent"] == intent)
             best_idx = self.cards.index(card)
 
-        if any(token in lowered for token in ["vs", "区别", "对比", "比较", "异同", "差别"]):
+        if any(token in lowered for token in ["故障", "报错", "异常", "根因", "排查", "诊断", "超时", "incident", "timeout", "oom", "不可用"]):
+            select("incident_diagnosis")
+        elif any(token in lowered for token in ["pr", "pull request", "代码审查", "code review", "审查这次", "review 这次"]):
+            select("pr_review")
+        elif any(token in lowered for token in ["变更影响", "影响哪些", "影响面", "受影响", "下游", "breaking", "兼容性影响"]):
+            select("change_impact")
+        elif any(token in lowered for token in ["验证计划", "测试方案", "如何验证", "怎么验证", "验收标准", "故障注入", "复现步骤"]):
+            select("validation_plan")
+        elif any(token in lowered for token in ["runbook", "运行手册", "上线步骤", "发布计划", "回滚步骤", "值班", "sop"]):
+            select("runbook_generation")
+        elif any(token in lowered for token in ["vs", "区别", "对比", "比较", "异同", "差别"]):
             select("compare")
-        elif re.search(r"(出|生成|来)\s*\d*\s*(道|个)?\s*(选择题|判断题|练习题|题目|quiz)", lowered) or any(
-            token in query for token in ["出题", "选择题", "判断题", "练习题", "测验", "自测"]
-        ):
-            select("quiz_generation")
-        elif any(token in query for token in ["总结", "重点", "归纳", "提纲", "复习重点", "梳理"]):
-            select("summarize")
-        elif any(token in query for token in ["复习计划", "学习计划", "备考", "时间表", "学习路径"]):
-            select("review_plan")
-        elif any(token in query for token in ["错题", "错了", "薄弱", "巩固", "回顾"]):
-            select("mistake_review")
-        elif any(token in query for token in ["简历", "岗位", "面试", "负责", "腾讯", "校招", "jd"]):
-            select("resume_packaging")
-        elif any(token in query for token in ["评估", "指标", "效果", "准确", "命中", "召回率", "幻觉"]):
+        elif any(token in query for token in ["总结", "归纳", "摘要", "证据地图", "梳理"]):
+            select("evidence_summary")
+        elif any(token in query for token in ["评估", "指标", "效果", "准确", "命中", "召回率"]):
             select("evaluation")
         elif any(token in query for token in ["链路", "架构", "工具调用", "执行流程", "怎么运行", "模块"]):
             select("agent_design")
         elif any(token in query for token in ["解释", "是什么", "什么是", "怎么理解", "定义", "原理", "作用"]) or detect_concept_card(query):
-            select("concept_explain")
+            select("repository_qa")
 
         return card["intent"], list(card["tools"]), float(scores[best_idx])
 
@@ -230,6 +276,7 @@ class OptionalLLMClient:
         self.base_url = os.getenv("AI_AGENT_LLM_BASE_URL", "").rstrip("/")
         self.api_key = os.getenv("AI_AGENT_LLM_API_KEY", "")
         self.model = os.getenv("AI_AGENT_LLM_MODEL", "gpt-4o-mini")
+        self.last_error: str | None = None
 
     @property
     def enabled(self) -> bool:
@@ -239,16 +286,16 @@ class OptionalLLMClient:
         if not self.enabled:
             return None
         url = f"{self.base_url}/chat/completions"
-        payload = {
+        payload: dict[str, Any] = {
             "model": self.model,
             "messages": [
                 {
                     "role": "system",
-                    "content": "你是课程资料知识库 Agent。优先基于给定资料回答；如果资料不相关或证据不足，要明确说明缺口。对 RAG、Agent、Embedding、OpenAI 等通用项目概念，可以补充通用解释，但必须标明这部分不是上传资料直接证据。",
+                    "content": "你是工程变更与故障诊断 Agent。只基于给定的仓库文档、变更说明、日志和运行手册形成结论。区分已证实事实、合理假设和待验证项；证据不足时必须明确缺口，不得虚构代码、日志或根因。",
                 },
                 {
                     "role": "user",
-                    "content": f"问题：{query}\n\n资料：\n{context}\n\n请给出结构化中文回答：先给结论，再列关键依据和来源；不要把低相关资料硬解释成答案。",
+                    "content": f"工程问题：{query}\n\n证据：\n{context}\n\n请给出结构化中文回答：先给判断，再列直接依据、风险和下一步验证；不要把低相关资料硬解释成结论。",
                 },
             ],
             "temperature": 0.2,
@@ -261,8 +308,13 @@ class OptionalLLMClient:
                 timeout=20,
             )
             response.raise_for_status()
+            self.last_error = None
             return response.json()["choices"][0]["message"]["content"]
-        except Exception:
+        except Exception as exc:
+            # Surface the failure instead of silently degrading to the local
+            # synthesizer so operators can tell "LLM unavailable" apart from
+            # "evidence insufficient".
+            self.last_error = f"{type(exc).__name__}: {exc}"
             return None
 
 
@@ -270,204 +322,456 @@ class KnowledgeAgent:
     def __init__(self, kb: KnowledgeBase) -> None:
         self.kb = kb
         self.memory = SessionMemory()
-        self.router = CapabilityRouter()
+        self.router = CapabilityRouter(kb.embedding_provider)
         self.llm = OptionalLLMClient()
+        self.max_retrieval_attempts = bounded_int_env(
+            "AI_AGENT_MAX_RETRIEVAL_ATTEMPTS", default=2, minimum=1, maximum=3
+        )
+        self.workflow = self._build_workflow()
+        self._debug_runs: dict[str, DebugCheckpoint] = {}
+        self._debug_lock = threading.Lock()
+
+    def workflow_spec(self) -> dict[str, Any]:
+        return {
+            "entrypoint": "route",
+            "nodes": [
+                "route",
+                "retrieve",
+                "verify_evidence",
+                "rewrite_query",
+                "execute_tools",
+                "synthesize",
+            ],
+            "edges": [
+                {"from": "route", "to": "retrieve", "when": "retrieval tool selected"},
+                {"from": "retrieve", "to": "verify_evidence", "when": "always"},
+                {
+                    "from": "verify_evidence",
+                    "to": "rewrite_query",
+                    "when": "low evidence and retry budget remains",
+                },
+                {"from": "rewrite_query", "to": "retrieve", "when": "retry"},
+                {
+                    "from": "verify_evidence",
+                    "to": "execute_tools",
+                    "when": "evidence sufficient or retry limit reached",
+                },
+                {"from": "execute_tools", "to": "synthesize", "when": "always"},
+            ],
+            "max_retrieval_attempts": self.max_retrieval_attempts,
+        }
 
     def ask(self, query: str, session_id: str | None = None, top_k: int = 6) -> AgentResponse:
         started = time.perf_counter()
         sid = self.memory.ensure(session_id)
-        normalized_query = self._resolve_follow_up(query, sid)
-        trace: list[ToolCall] = []
+        state = self._new_state(query, sid, top_k)
+        graph_run = self.workflow.run(state)
+        return self._build_response(sid, state, graph_run, started, record_memory=True)
 
-        intent, tools, confidence = timed_call(
-            trace,
-            "intent_router",
-            {"query": query},
-            lambda: self._route(normalized_query),
+    def debug_start(
+        self,
+        query: str,
+        session_id: str | None = None,
+        top_k: int = 6,
+        breakpoints: list[str] | None = None,
+    ) -> DebugResponse:
+        started = time.perf_counter()
+        sid = self.memory.ensure(session_id)
+        state = self._new_state(query, sid, top_k)
+        active_breakpoints = self._validate_breakpoints(breakpoints or [])
+        run_id = str(uuid.uuid4())
+        graph_run = self.workflow.run(state, breakpoints=active_breakpoints)
+        return self._finish_debug_step(
+            run_id,
+            sid,
+            query,
+            top_k,
+            active_breakpoints,
+            state,
+            graph_run,
+            started,
         )
 
-        hits: list[SearchHit] = []
-        if "hybrid_retrieval" in tools:
-            hits = timed_call(
-                trace,
-                "hybrid_retrieval",
-                {"query": normalized_query, "top_k": top_k},
-                lambda: self.kb.search(normalized_query, top_k=top_k),
-            )
-            if "rerank" in tools:
-                trace.append(
-                    ToolCall(
-                        name="rerank",
-                        input={"candidates": len(hits)},
-                        output={
-                            "strategy": f"{self.kb.stats()['vector_backend']} + keyword + title + section boost"
-                        },
-                        latency_ms=0,
-                    )
-                )
-            if evidence_is_weak(hits) and intent in {"summarize", "quiz_generation", "review_plan"}:
-                fallback_query = fallback_query_for_intent(intent, normalized_query)
-                fallback_hits = timed_call(
-                    trace,
-                    "fallback_retrieval",
-                    {
-                        "reason": "low_evidence",
-                        "original_top_score": round(hits[0].score, 4) if hits else 0.0,
-                        "query": fallback_query,
-                    },
-                    lambda: self.kb.search(fallback_query, top_k=top_k),
-                )
-                if fallback_hits and (not hits or fallback_hits[0].score > hits[0].score):
-                    hits = fallback_hits
+    def debug_resume(
+        self,
+        run_id: str,
+        *,
+        query: str | None = None,
+        breakpoints: list[str] | None = None,
+        restart: bool = False,
+    ) -> DebugResponse:
+        with self._debug_lock:
+            checkpoint = self._debug_runs.get(run_id)
+        if checkpoint is None:
+            raise KeyError(run_id)
+        started = time.perf_counter()
+        active_breakpoints = self._validate_breakpoints(
+            breakpoints if breakpoints is not None else sorted(checkpoint.breakpoints)
+        )
+        next_query = (query or checkpoint.query).strip()
 
-        if "agent_planner" in tools:
-            timed_call(
-                trace,
-                "agent_planner",
-                {"intent": intent, "query": normalized_query},
-                lambda: agent_plan(intent, tools),
+        if restart:
+            state = self._new_state(next_query, checkpoint.session_id, checkpoint.top_k)
+            state.trace.append(
+                ToolCall(
+                    name="debug_query_edit",
+                    input={"previous_query": checkpoint.query},
+                    output={"query": next_query, "restart_from": "route"},
+                    latency_ms=0,
+                )
             )
-        if "compare_tool" in tools:
-            timed_call(
-                trace,
-                "compare_tool",
-                {"query": normalized_query, "evidence": len(hits)},
-                lambda: compare_tool(normalized_query, hits),
-            )
-        if "resume_tool" in tools:
-            timed_call(
-                trace,
-                "resume_tool",
-                {"query": normalized_query, "evidence": len(hits)},
-                lambda: resume_tool(hits),
-            )
-        if "evaluation_tool" in tools:
-            timed_call(
-                trace,
-                "evaluation_tool",
-                {"query": normalized_query, "evidence": len(hits)},
-                lambda: evaluation_tool(),
-            )
-        if "summarize_tool" in tools:
-            timed_call(
-                trace,
-                "summarize_tool",
-                {"query": normalized_query, "evidence": len(hits)},
-                lambda: summarize_tool(normalized_query, hits),
-            )
-        if "generate_quiz" in tools:
-            timed_call(
-                trace,
-                "generate_quiz",
-                {"query": normalized_query, "evidence": len(hits)},
-                lambda: quiz_tool(normalized_query, hits),
-            )
-        if "explain_concept" in tools:
-            timed_call(
-                trace,
-                "explain_concept",
-                {"query": normalized_query, "evidence": len(hits)},
-                lambda: explain_tool(normalized_query, hits),
-            )
-        if "make_review_plan" in tools:
-            timed_call(
-                trace,
-                "make_review_plan",
-                {"query": normalized_query, "evidence": len(hits)},
-                lambda: review_plan_tool(normalized_query, hits),
-            )
-        if "mistake_review" in tools:
-            timed_call(
-                trace,
-                "mistake_review",
-                {"query": normalized_query, "evidence": len(hits)},
-                lambda: mistake_review_tool(normalized_query, hits),
+            graph_run = self.workflow.run(state, breakpoints=active_breakpoints)
+        else:
+            if next_query != checkpoint.query:
+                raise ValueError("editing a paused query requires restart=true")
+            state = checkpoint.state
+            graph_run = self.workflow.run(
+                state,
+                start_at=checkpoint.run.next_node,
+                prior_path=checkpoint.run.path,
+                prior_events=checkpoint.run.events,
+                breakpoints=active_breakpoints,
+                skip_breakpoint_once=checkpoint.run.next_node,
             )
 
-        answer = timed_call(
-            trace,
-            "answer_synthesizer",
-            {
-                "intent": intent,
-                "hits": len(hits),
-                "top_score": round(hits[0].score, 4) if hits else 0.0,
-                "evidence_quality": "low" if evidence_is_weak(hits) else "ok",
-                "llm_enabled": self.llm.enabled,
-                "vector_backend": self.kb.stats()["vector_backend"],
-            },
-            lambda: self._synthesize(normalized_query, intent, hits),
+        return self._finish_debug_step(
+            run_id,
+            checkpoint.session_id,
+            next_query,
+            checkpoint.top_k,
+            active_breakpoints,
+            state,
+            graph_run,
+            started,
         )
 
-        citations = [hit.to_dict() for hit in hits[:4]]
-        suggestions = suggest_followups(intent)
-        self.memory.add(sid, "user", query)
-        self.memory.add(sid, "assistant", answer)
+    def cancel_debug(self, run_id: str) -> bool:
+        with self._debug_lock:
+            return self._debug_runs.pop(run_id, None) is not None
+
+    def _new_state(self, query: str, session_id: str, top_k: int) -> AgentState:
+        normalized_query = self._resolve_follow_up(query, session_id)
+        return AgentState(
+            query=query,
+            normalized_query=normalized_query,
+            retrieval_query=normalized_query,
+            top_k=top_k,
+            trace=[],
+        )
+
+    def _validate_breakpoints(self, breakpoints: list[str]) -> set[str]:
+        valid = set(self.workflow_spec()["nodes"])
+        unknown = sorted(set(breakpoints) - valid)
+        if unknown:
+            raise ValueError(f"unknown breakpoint nodes: {', '.join(unknown)}")
+        return set(breakpoints)
+
+    def _finish_debug_step(
+        self,
+        run_id: str,
+        session_id: str,
+        query: str,
+        top_k: int,
+        breakpoints: set[str],
+        state: AgentState,
+        graph_run: GraphRun,
+        started: float,
+    ) -> DebugResponse:
+        completed = graph_run.status == "completed"
+        response = self._build_response(
+            session_id,
+            state,
+            graph_run,
+            started,
+            record_memory=completed,
+        )
+        if completed:
+            with self._debug_lock:
+                self._debug_runs.pop(run_id, None)
+        else:
+            checkpoint = DebugCheckpoint(
+                run_id=run_id,
+                session_id=session_id,
+                query=query,
+                top_k=top_k,
+                breakpoints=breakpoints,
+                state=state,
+                run=graph_run,
+            )
+            with self._debug_lock:
+                self._debug_runs[run_id] = checkpoint
+        return DebugResponse(
+            run_id=run_id,
+            status=graph_run.status,
+            next_node=graph_run.next_node,
+            breakpoints=sorted(breakpoints),
+            query=query,
+            response=response,
+        )
+
+    def _build_response(
+        self,
+        sid: str,
+        state: AgentState,
+        graph_run: GraphRun,
+        started: float,
+        *,
+        record_memory: bool,
+    ) -> AgentResponse:
+
+        citations = [hit.to_dict() for hit in state.hits[:4]]
+        suggestions = suggest_followups(state.intent)
+        if record_memory:
+            self.memory.add(sid, "user", state.query)
+            self.memory.add(sid, "assistant", state.answer)
+        kb_stats = self.kb.stats()
         metrics = {
             "latency_ms": int((time.perf_counter() - started) * 1000),
-            "router_confidence": round(confidence, 4),
-            "retrieved_chunks": len(hits),
-            "top_score": round(hits[0].score, 4) if hits else 0.0,
-            "evidence_quality": "low" if evidence_is_weak(hits) else "ok",
+            "router_confidence": round(state.router_confidence, 4),
+            "retrieved_chunks": len(state.hits),
+            "top_score": round(state.hits[0].score, 4) if state.hits else 0.0,
+            "evidence_quality": state.evidence_quality,
             "llm_mode": "openai_compatible" if self.llm.enabled else "local_synthesizer",
-            "vector_backend": self.kb.stats()["vector_backend"],
+            "llm_error": getattr(self.llm, "last_error", None),
+            "vector_backend": kb_stats["vector_backend"],
+            "vector_backend_error": kb_stats["vector_backend_error"],
+            "embedding_model": kb_stats["embedding_model"],
+            "embedding_dimensions": kb_stats["embedding_dimensions"],
+            "reranker": kb_stats["reranker"],
+            "reranker_requested": kb_stats["reranker_requested"],
+            "reranker_error": kb_stats["reranker_error"],
+            "reranker_degraded": kb_stats["reranker_degraded"],
+            "reranker_fallback_count": kb_stats["reranker_fallback_count"],
+            "retrieval_attempts": state.retrieval_attempts,
+            "stop_reason": "breakpoint" if graph_run.status == "paused" else state.stop_reason,
+            "graph_path": graph_run.path,
+            "workflow_steps": graph_run.transitions,
+            "run_status": graph_run.status,
+            "next_node": graph_run.next_node,
+            "graph_events": [serialize_graph_event(event) for event in graph_run.events],
         }
         return AgentResponse(
             session_id=sid,
-            answer=answer,
-            intent=intent,
+            answer=state.answer,
+            intent=state.intent,
             citations=citations,
-            trace=trace,
+            trace=state.trace,
             suggestions=suggestions,
             metrics=metrics,
+        )
+
+    def _build_workflow(self) -> StateGraph:
+        graph = StateGraph()
+        graph.add_node("route", self._route_node)
+        graph.add_node("retrieve", self._retrieve_node)
+        graph.add_node("verify_evidence", self._verify_evidence_node)
+        graph.add_node("rewrite_query", self._rewrite_query_node)
+        graph.add_node("execute_tools", self._execute_tools_node)
+        graph.add_node("synthesize", self._synthesize_node)
+        graph.set_entrypoint("route")
+        graph.add_edge(
+            "route",
+            lambda state: "retrieve" if "hybrid_retrieval" in state.tools else "execute_tools",
+        )
+        graph.add_edge("retrieve", "verify_evidence")
+        graph.add_edge(
+            "verify_evidence",
+            lambda state: "rewrite_query"
+            if state.evidence_quality == "low"
+            and state.retrieval_attempts < self.max_retrieval_attempts
+            else "execute_tools",
+        )
+        graph.add_edge("rewrite_query", "retrieve")
+        graph.add_edge("execute_tools", "synthesize")
+        graph.add_edge("synthesize", END)
+        return graph
+
+    def _route_node(self, state: AgentState) -> None:
+        state.intent, state.tools, state.router_confidence = timed_call(
+            state.trace,
+            "intent_router",
+            {"query": state.query},
+            lambda: self._route(state.normalized_query),
+        )
+
+    def _retrieve_node(self, state: AgentState) -> None:
+        state.retrieval_attempts += 1
+        current_hits = timed_call(
+            state.trace,
+            "hybrid_retrieval",
+            {
+                "query": state.retrieval_query,
+                "top_k": state.top_k,
+                "attempt": state.retrieval_attempts,
+            },
+            lambda: self.kb.search(state.retrieval_query, top_k=state.top_k),
+        )
+        if current_hits and (
+            not state.best_hits or current_hits[0].score > state.best_hits[0].score
+        ):
+            state.best_hits = current_hits
+        state.hits = state.best_hits or current_hits
+
+        if "rerank" in state.tools:
+            kb_stats = self.kb.stats()
+            state.trace.append(
+                ToolCall(
+                    name="rerank",
+                    input={"candidates": len(current_hits), "attempt": state.retrieval_attempts},
+                    output={
+                        "requested_strategy": kb_stats["reranker_requested"],
+                        "strategy": kb_stats["reranker"],
+                        "fallback_error": kb_stats["reranker_error"],
+                        "degraded": kb_stats["reranker_degraded"],
+                        "fallback_count": kb_stats["reranker_fallback_count"],
+                    },
+                    latency_ms=0,
+                )
+            )
+
+    def _verify_evidence_node(self, state: AgentState) -> None:
+        weak = evidence_is_weak(state.hits, state.normalized_query)
+        state.evidence_quality = "low" if weak else "ok"
+        if not weak:
+            state.stop_reason = "evidence_sufficient"
+        elif state.retrieval_attempts >= self.max_retrieval_attempts:
+            state.stop_reason = "retrieval_retry_limit"
+        state.trace.append(
+            ToolCall(
+                name="evidence_verifier",
+                input={
+                    "attempt": state.retrieval_attempts,
+                    "threshold": LOW_EVIDENCE_SCORE,
+                },
+                output={
+                    "quality": state.evidence_quality,
+                    "top_score": round(state.hits[0].score, 4) if state.hits else 0.0,
+                    "next": "rewrite_query"
+                    if weak and state.retrieval_attempts < self.max_retrieval_attempts
+                    else "execute_tools",
+                },
+                latency_ms=0,
+            )
+        )
+
+    def _rewrite_query_node(self, state: AgentState) -> None:
+        previous_query = state.retrieval_query
+        state.retrieval_query = rewrite_query_for_retry(
+            state.intent,
+            state.normalized_query,
+            state.retrieval_attempts,
+        )
+        state.trace.append(
+            ToolCall(
+                name="query_rewrite",
+                input={"query": previous_query, "reason": "low_evidence"},
+                output={"query": state.retrieval_query},
+                latency_ms=0,
+            )
+        )
+
+    def _execute_tools_node(self, state: AgentState) -> None:
+        if "hybrid_retrieval" not in state.tools:
+            state.evidence_quality = "not_required"
+            state.stop_reason = "tool_only_workflow"
+        tool_map = {
+            "agent_planner": lambda: agent_plan(state.intent, state.tools),
+            "compare_tool": lambda: compare_tool(state.normalized_query, state.hits),
+            "evaluation_tool": evaluation_tool,
+            "evidence_summary": lambda: evidence_summary_tool(state.normalized_query, state.hits),
+            "explain_component": lambda: explain_component_tool(state.normalized_query, state.hits),
+            "impact_analysis": lambda: impact_analysis_tool(state.normalized_query, state.hits),
+            "incident_triage": lambda: incident_triage_tool(state.normalized_query, state.hits),
+            "pr_review": lambda: pr_review_tool(state.normalized_query, state.hits),
+            "validation_plan": lambda: validation_plan_tool(state.normalized_query, state.hits),
+            "runbook": lambda: runbook_tool(state.normalized_query, state.hits),
+        }
+        for tool_name in state.tools:
+            tool = tool_map.get(tool_name)
+            if tool is None:
+                continue
+            timed_call(
+                state.trace,
+                tool_name,
+                {
+                    "intent": state.intent,
+                    "query": state.normalized_query,
+                    "evidence": len(state.hits),
+                },
+                tool,
+            )
+
+    def _synthesize_node(self, state: AgentState) -> None:
+        state.answer = timed_call(
+            state.trace,
+            "answer_synthesizer",
+            {
+                "intent": state.intent,
+                "hits": len(state.hits),
+                "top_score": round(state.hits[0].score, 4) if state.hits else 0.0,
+                "evidence_quality": state.evidence_quality,
+                "llm_enabled": self.llm.enabled,
+                "vector_backend": self.kb.stats()["vector_backend"],
+            },
+            lambda: self._synthesize(state.normalized_query, state.intent, state.hits),
         )
 
     def _route(self, query: str) -> tuple[str, list[str], float]:
         return self.router.route(query)
 
     def _resolve_follow_up(self, query: str, session_id: str) -> str:
-        if re.search(r"(刚才|上面|这个|它|该项目|再|继续)", query):
+        # Deliberately narrow: "这个/它/再" appear in ordinary standalone
+        # questions ("这个系统的架构是什么") and would pollute retrieval with
+        # the previous topic. Only explicit anaphora triggers a merge.
+        if re.search(r"(刚才|上面|该项目|继续|再讲|再详细|那个|追问)", query):
             topic = self.memory.last_user_topic(session_id)
             if topic:
                 return f"{topic}\n追问：{query}"
         return query
 
     def _synthesize(self, query: str, intent: str, hits: list[SearchHit]) -> str:
-        context = "\n\n".join(
-            f"[{idx + 1}] {hit.chunk.title} / {hit.chunk.section}: {hit.chunk.text}"
-            for idx, hit in enumerate(hits[:5])
-        )
-        llm_answer = self.llm.chat(query, context)
-        if llm_answer:
-            return llm_answer
-
         concept_card = detect_concept_card(query)
-        if concept_card and intent in {"rag_answer", "concept_explain"}:
+        if concept_card and intent == "repository_qa":
             return synthesize_concept_card(query, concept_card, hits)
 
         if not hits:
             return "知识库里暂时没有足够依据回答这个问题。可以先上传相关文档，或把问题拆成概念、流程、评估指标三个部分再问。"
 
-        if evidence_is_weak(hits) and intent not in {"resume_packaging", "agent_design", "evaluation"}:
+        weak_evidence = evidence_is_weak(hits, query)
+        if weak_evidence and intent not in {"agent_design", "evaluation"}:
             return synthesize_low_evidence_answer(query, hits)
+
+        # Only grounded questions reach the external model. Project meta intents
+        # use deterministic local templates when retrieval evidence is weak.
+        if not weak_evidence:
+            context = "\n\n".join(
+                f"[{idx + 1}] {hit.chunk.title} / {hit.chunk.section}: {hit.chunk.text}"
+                for idx, hit in enumerate(hits[:5])
+            )
+            llm_answer = self.llm.chat(query, context)
+            if llm_answer:
+                return llm_answer
 
         if intent == "compare":
             return synthesize_compare(query, hits)
-        if intent == "resume_packaging":
-            return synthesize_resume(query, hits)
         if intent == "agent_design":
             return synthesize_agent_design(query, hits)
         if intent == "evaluation":
             return synthesize_evaluation(query, hits)
-        if intent == "summarize":
-            return synthesize_summary(query, hits)
-        if intent == "quiz_generation":
-            return synthesize_quiz(query, hits)
-        if intent == "concept_explain":
-            return synthesize_explain(query, hits)
-        if intent == "review_plan":
-            return synthesize_review_plan(query, hits)
-        if intent == "mistake_review":
-            return synthesize_mistake_review(query, hits)
+        if intent == "evidence_summary":
+            return synthesize_evidence_summary(query, hits)
+        if intent == "change_impact":
+            return synthesize_impact_analysis(query, hits)
+        if intent == "incident_diagnosis":
+            return synthesize_incident_triage(query, hits)
+        if intent == "pr_review":
+            return synthesize_pr_review(query, hits)
+        if intent == "validation_plan":
+            return synthesize_validation_plan(query, hits)
+        if intent == "runbook_generation":
+            return synthesize_runbook(query, hits)
+        if intent == "repository_qa":
+            return synthesize_explain_component(query, hits)
         return synthesize_rag_answer(query, hits)
 
 
@@ -484,6 +788,17 @@ def timed_call(trace: list[ToolCall], name: str, input_payload: dict[str, Any], 
         )
     )
     return result
+
+
+def serialize_graph_event(event: GraphEvent) -> dict[str, Any]:
+    return {
+        "sequence": event.sequence,
+        "node": event.node,
+        "status": event.status,
+        "latency_ms": event.latency_ms,
+        "next_node": event.next_node,
+        "detail": event.detail,
+    }
 
 
 def summarize_tool_output(result: Any) -> dict[str, Any]:
@@ -508,18 +823,94 @@ def summarize_tool_output(result: Any) -> dict[str, Any]:
     return {"value": result}
 
 
-def evidence_is_weak(hits: list[SearchHit]) -> bool:
-    return not hits or hits[0].score < LOW_EVIDENCE_SCORE
+def evidence_is_weak(hits: list[SearchHit], query: str | None = None) -> bool:
+    if not hits or hits[0].score < LOW_EVIDENCE_SCORE:
+        return True
+    if not query:
+        return False
+    return not has_direct_query_signal(query, hits)
+
+
+def has_direct_query_signal(query: str, hits: list[SearchHit]) -> bool:
+    """Require at least one domain-bearing token from the original question.
+
+    Rewritten queries intentionally add generic retrieval vocabulary. Without
+    this check those generic words can make an unrelated chunk look strong and
+    cause the verification loop to accept fabricated evidence.
+    """
+
+    english = {
+        item.lower()
+        for item in re.findall(r"[A-Za-z][A-Za-z0-9_\-]{1,}", query)
+        if item.lower() not in {"is", "the", "and", "for", "with", "what", "how"}
+    }
+    chinese_sequences = re.findall(r"[\u4e00-\u9fff]{4,}", query)
+    chinese: set[str] = set()
+    for sequence in chinese_sequences:
+        upper = min(8, len(sequence))
+        for width in range(4, upper + 1):
+            chinese.update(
+                sequence[index : index + width]
+                for index in range(len(sequence) - width + 1)
+            )
+    generic = {
+        "这个项目",
+        "什么是",
+        "是什么",
+        "怎么写",
+        "解释这个",
+        "根据资料",
+        "资料的",
+        "工程资料",
+    }
+    chinese.difference_update(generic)
+    signals = english | chinese
+    if not signals:
+        return True
+    return any(
+        any(
+            signal
+            in f"{hit.chunk.title} {hit.chunk.section} {hit.chunk.text}".lower()
+            for signal in signals
+        )
+        for hit in hits[:4]
+    )
 
 
 def fallback_query_for_intent(intent: str, query: str) -> str:
-    if intent == "quiz_generation":
-        return f"{query} 自然语言处理 核心概念 模型 方法 评估 定义 原理"
-    if intent == "summarize":
-        return f"{query} 章节重点 核心概念 方法流程 应用场景"
-    if intent == "review_plan":
-        return f"{query} 复习重点 核心概念 典型题型 易错点"
+    if intent == "change_impact":
+        return f"{query} 调用方 接口 状态 数据 依赖 兼容性 回滚"
+    if intent == "incident_diagnosis":
+        return f"{query} 原始错误 失败阶段 配置 依赖 超时 资源 回退"
+    if intent == "pr_review":
+        return f"{query} 变更范围 兼容性 错误处理 重试 测试 回归"
+    if intent == "validation_plan":
+        return f"{query} baseline oracle 故障注入 停止条件 回滚验证"
     return query
+
+
+def rewrite_query_for_retry(intent: str, query: str, attempt: int) -> str:
+    """Create a bounded retrieval retry query without asking the LLM.
+
+    Intent-aware expansion keeps the retry deterministic and testable. The
+    workflow graph owns the retry count, so this function cannot loop itself.
+    """
+
+    intent_query = fallback_query_for_intent(intent, query)
+    expansions = {
+        "repository_qa": "组件 职责 输入 输出 依赖 调用关系 失败模式",
+        "evidence_summary": "事实 证据 来源 范围 假设 缺口",
+        "change_impact": "接口 状态 数据 依赖 下游 兼容性 回滚",
+        "incident_diagnosis": "异常 日志 失败阶段 根因假设 诊断 恢复",
+        "pr_review": "变更 风险 兼容 错误处理 重试 测试 回归",
+        "validation_plan": "基线 测试 oracle 故障注入 回退 回滚",
+        "runbook_generation": "前置检查 发布 观测 扩量 回退 恢复",
+        "compare": "定义 区别 联系 优点 缺点 应用场景",
+        "agent_design": "架构 状态 节点 工具 调用流程 验证",
+        "evaluation": "评估集 指标 召回率 MRR 忠实度 延迟",
+    }
+    suffix = expansions.get(intent, "组件 证据 风险 验证 回滚")
+    return f"{intent_query} {suffix} retrieval-retry-{attempt + 1}"
 
 
 def detect_concept_card(query: str) -> dict[str, Any] | None:
@@ -559,22 +950,22 @@ def synthesize_concept_card(query: str, card: dict[str, Any], hits: list[SearchH
         f"{card['title']}可以这样理解：",
         f"- 是什么：{card['definition']}",
         f"- 在本系统里的作用：{card['system_role']}",
-        f"- 面试表达：{card['interview']}",
+        f"- 工程约束：{card['engineering']}",
     ]
     if hits and not evidence_is_weak(hits):
         lines.append(f"- {source_summary(hits, limit=2)}")
     else:
-        lines.append("- 说明：当前上传课程资料里没有足够直接的对应片段，所以这里使用项目内置概念卡片兜底，避免强行引用无关 chunk。")
+        lines.append("- 说明：当前工程资料里没有足够直接的对应片段，这里只使用内置概念卡片说明系统机制，不把无关 chunk 当作证据。")
     return "\n".join(lines)
 
 
 def synthesize_low_evidence_answer(query: str, hits: list[SearchHit]) -> str:
     lines = [
-        "这个问题在当前知识库里的直接证据不足，我不建议硬从低相关片段里拼答案。",
-        "可以这样处理：",
-        "- 如果这是课程资料问题，建议补充更具体的章节名、概念名，或上传对应课件。",
-        "- 如果这是刚上传的 Word 实验报告，请看资料列表的 chunk 数；只有 1 个 chunk 或正文很短时，通常说明旧索引只读到了封面，需要删除旧资料后重新上传。",
-        "- 如果这是项目/岗位问题，可以问 RAG、Agent、Embedding、Rerank、OpenAI、Prompt 等关键词，我会走项目内置概念卡片兜底。",
+        "这个问题在当前工程知识库里的直接证据不足，不能从低相关片段拼出确定结论。",
+        "建议补充：",
+        "- 相关代码路径、PR diff 或架构决策记录；",
+        "- 原始错误、时间窗口、run id、关键配置与最近变更；",
+        "- 期望行为、实际行为、复现步骤和可接受的回退目标。",
     ]
     if hits:
         lines.append("低相关候选片段仅供定位，不作为强依据：")
@@ -601,27 +992,16 @@ def synthesize_compare(query: str, hits: list[SearchHit]) -> str:
             "RAG 和 Agent 的关系可以这样理解：\n"
             "- RAG 解决“从哪里找依据”的问题，核心是文档切分、Embedding、召回、Rerank 和带引用生成。\n"
             "- Agent 解决“下一步做什么”的问题，核心是意图判断、工具选择、Planning、Memory 和执行链路追踪。\n"
-            "- 在本项目里，Agent 会先判断问题类型，再调用 RAG 检索工具、对比工具或简历包装工具，所以 RAG 是 Agent 的一个关键工具。\n"
+            "- 在本系统里，Agent 会先判断工程任务，再调用 RAG 检索、影响分析、故障诊断或验证工具，所以 RAG 是证据获取能力之一。\n"
             f"- {source_summary(hits, limit=2)}"
         )
     return synthesize_rag_answer(query, hits)
 
 
-def synthesize_resume(query: str, hits: list[SearchHit]) -> str:
-    return (
-        "简历上建议把这个项目写成“基于 RAG 与 Agent 的课程知识库智能问答系统”。可突出三点：\n"
-        "- 工程闭环：完成文档解析、Chunk 切分、向量召回、混合检索、Rerank、答案生成与前端演示。\n"
-        "- Agent 能力：设计意图路由器，根据问题自动选择知识库检索、对比分析、评估说明、简历包装等工具。\n"
-        "- 学习场景：支持课程问答、重点总结、自动出题、复习计划和错题回顾，产品形态更贴近学生真实使用。\n"
-        "- 岗位适配：覆盖 LLM 调用、Prompt 工程、Embedding、向量数据库替换接口、RAG、Tool Use、Planning、Memory 等 AI 原生工程关键词。\n"
-        f"- 可引用依据：{hits[0].chunk.source} / {hits[0].chunk.section}"
-    )
-
-
 def synthesize_agent_design(query: str, hits: list[SearchHit]) -> str:
     return (
-        "这个 Agent 的执行链路是：用户问题 -> 意图路由 -> 工具选择 -> 混合检索 -> Rerank -> 答案生成 -> 引用追溯 -> 多轮记忆更新。\n"
-        "其中 Tool Use 体现在可调用 retrieval、compare、evaluation、resume 等工具；Planning 体现在按问题类型组合工具链；Memory 体现在 session 内追问补全。"
+        "这个 Agent 的执行链路是：Route -> Retrieve/Rerank -> Verify Evidence -> 必要时 Rewrite Query 并有界重试 -> Execute Tools -> Synthesize。\n"
+        "State Graph 显式保存意图、最佳证据、重试次数和停止原因；Tool Use 负责检索与工程分析，Session Memory 负责追问补全，Graph Path 与 Trace 用于观测和回归验证。"
     )
 
 
@@ -630,9 +1010,9 @@ def synthesize_evaluation(query: str, hits: list[SearchHit]) -> str:
         "评估可以从四层做：\n"
         "- 检索层：Top-K 命中率、MRR、召回片段相关性。\n"
         "- 生成层：答案忠实度、引用覆盖率、幻觉率。\n"
-        "- Agent 层：工具选择准确率、平均调用步数、失败恢复能力。\n"
+        "- Agent 层：意图准确率、工具选择准确率、证据门控准确率、平均调用步数和停止原因。\n"
         "- 工程层：响应延迟、并发稳定性、知识库增量更新耗时。\n"
-        f"当前演示接口已经返回 latency、retrieved_chunks 和 router_confidence，便于后续扩展实验面板。"
+        "当前演示接口返回 latency、retrieved_chunks、reranker、retrieval_attempts、graph_path 和 stop_reason，并配有 JSONL 基线评估。"
     )
 
 
@@ -657,22 +1037,6 @@ def compare_tool(query: str, hits: list[SearchHit]) -> dict[str, Any]:
     }
 
 
-def resume_tool(hits: list[SearchHit]) -> dict[str, Any]:
-    return {
-        "matched_jd_keywords": [
-            "RAG",
-            "Embedding",
-            "Agent",
-            "Tool Use",
-            "Planning",
-            "Memory",
-            "Prompt Engineering",
-        ],
-        "evidence_sources": [hit.chunk.source for hit in hits[:3]],
-        "suggested_project_name": "基于 RAG 与 Agent 的课程知识库智能问答系统",
-    }
-
-
 def evaluation_tool() -> dict[str, Any]:
     return {
         "retrieval_metrics": ["Top-K hit rate", "MRR", "rerank score"],
@@ -688,19 +1052,19 @@ def detect_topics(query: str) -> list[str]:
     for label in ["rag", "agent", "embedding", "rerank", "memory", "tool use"]:
         if label in lowered:
             topics.append(label)
-    if "简历" in query or "岗位" in query:
-        topics.append("resume")
     return topics or ["knowledge_base"]
 
 
 def suggest_followups(intent: str) -> list[str]:
     common = [
-        "把这个项目整理成简历项目经历",
-        "RAG 和 Agent 在这个系统里分别负责什么",
-        "如何把本地 TF-IDF 替换成真实 Embedding 和向量数据库",
+        "分析这项变更的调用方、状态与回退风险",
+        "为失败路径设计可执行的验证计划",
+        "如何在轨迹图中定位一次低证据重试",
     ]
+    if intent == "incident_diagnosis":
+        return ["还需要补充哪些日志才能确认根因", "给出最小复现与回退步骤", "把诊断过程整理成 Runbook"]
+    if intent == "pr_review":
+        return ["列出这个 PR 的测试缺口", "检查重试与停止条件", "生成合并前验证计划"]
     if intent == "evaluation":
-        return ["设计一组问答评估集", "怎么降低幻觉率", "如何记录召回命中率"]
-    if intent == "resume_packaging":
-        return ["帮我写 STAR 面试讲法", "压缩成简历两行版", "补一个项目难点和解决方案"]
+        return ["设计一组变更分析评估集", "怎么验证证据门控", "如何记录工具选择准确率"]
     return common

@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import base64
 import io
+import os
+import threading
 import time
 import zipfile
+from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, AsyncIterator
 from xml.etree import ElementTree as ET
 
 from fastapi import FastAPI, HTTPException
@@ -14,13 +17,18 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from .agent import AgentResponse, KnowledgeAgent, ToolCall
+from .agent import AgentResponse, DebugResponse, KnowledgeAgent, ToolCall
+from .document_store import normalize_content, resolve_document_target
 from .rag_engine import KnowledgeBase
-
 
 ROOT = Path(__file__).resolve().parents[1]
 DATA_DIR = ROOT / "data" / "knowledge_base"
 WEB_DIR = ROOT / "web"
+
+MAX_UPLOAD_BYTES = 20 * 1024 * 1024  # decoded payload cap for uploads
+
+INIT_RETRIES = 3
+INIT_RETRY_DELAY_S = 2
 
 
 class AskRequest(BaseModel):
@@ -29,27 +37,88 @@ class AskRequest(BaseModel):
     top_k: int = Field(default=6, ge=1, le=12)
 
 
+class DebugRunRequest(AskRequest):
+    breakpoints: list[str] = Field(default_factory=list, max_length=6)
+
+
+class DebugResumeRequest(BaseModel):
+    run_id: str = Field(..., min_length=1, max_length=80)
+    query: str | None = Field(default=None, min_length=1, max_length=1200)
+    breakpoints: list[str] | None = Field(default=None, max_length=6)
+    restart: bool = False
+
+
 class DocumentRequest(BaseModel):
     title: str = Field(..., min_length=1, max_length=120)
-    content: str = Field(..., min_length=20)
+    content: str = Field(..., min_length=20, max_length=5_000_000)
     source: str | None = Field(default=None, max_length=120)
 
 
 class DocumentUploadRequest(BaseModel):
     filename: str = Field(..., min_length=1, max_length=180)
-    content_base64: str = Field(..., min_length=8)
+    content_base64: str = Field(..., min_length=8, max_length=30_000_000)
     title: str | None = Field(default=None, max_length=120)
 
 
+def cors_origins() -> list[str]:
+    """Explicit origin list; a wildcard cannot be combined with credentials.
+
+    Override with AI_AGENT_CORS_ORIGINS (comma-separated). The defaults cover
+    the app itself and common local dev servers.
+    """
+
+    configured = os.getenv("AI_AGENT_CORS_ORIGINS", "").strip()
+    if configured:
+        return [origin.strip() for origin in configured.split(",") if origin.strip()]
+    return [
+        "http://localhost:8015",
+        "http://127.0.0.1:8015",
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "http://localhost:8080",
+        "http://127.0.0.1:8080",
+    ]
+
+
+# The knowledge base and agent are built in a background thread so the server
+# starts responding immediately even when the embedding model has to be
+# downloaded on first run. Endpoints gate on readiness and answer 503 with a
+# friendly message while initialization is in flight.
+kb: KnowledgeBase | None = None
+agent: KnowledgeAgent | None = None
+init_error: str | None = None
+
+
+def _init_background() -> None:
+    global kb, agent, init_error
+    for attempt in range(INIT_RETRIES):
+        try:
+            kb = KnowledgeBase(DATA_DIR)
+            agent = KnowledgeAgent(kb)
+            init_error = None
+            return
+        except Exception as exc:  # e.g. transient model-download failure
+            init_error = f"{type(exc).__name__}: {exc}"
+            if attempt + 1 < INIT_RETRIES:
+                time.sleep(INIT_RETRY_DELAY_S * (attempt + 1))
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
+    threading.Thread(target=_init_background, name="kb-loader", daemon=True).start()
+    yield
+
+
 app = FastAPI(
-    title="AI Course Study Agent",
-    description="Course-material RAG + Learning Agent demo for AI native engineering roles.",
-    version="0.3.0",
+    title="Engineering Change Intelligence Agent",
+    description="Evidence-grounded repository change analysis and incident diagnosis agent.",
+    version="0.5.0",
+    lifespan=lifespan,
 )
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=cors_origins(),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -58,8 +127,17 @@ app.add_middleware(
 if WEB_DIR.exists():
     app.mount("/static", StaticFiles(directory=str(WEB_DIR)), name="static")
 
-kb = KnowledgeBase(DATA_DIR)
-agent = KnowledgeAgent(kb)
+
+def require_kb() -> KnowledgeBase:
+    if kb is None:
+        raise HTTPException(status_code=503, detail=init_error or "知识库正在初始化，请稍后重试")
+    return kb
+
+
+def require_agent() -> KnowledgeAgent:
+    if agent is None:
+        raise HTTPException(status_code=503, detail=init_error or "知识库正在初始化，请稍后重试")
+    return agent
 
 
 @app.get("/")
@@ -70,43 +148,63 @@ def index() -> FileResponse:
 @app.get("/api/health")
 def health() -> dict[str, Any]:
     return {
-        "status": "ok",
-        "service": "ai-course-study-agent",
+        "status": "ok" if kb is not None else "initializing",
+        "service": "engineering-change-intelligence-agent",
         "time": time.time(),
-        "kb": kb.stats(),
+        "kb": kb.stats() if kb is not None else None,
+        "error": init_error if kb is None else None,
     }
 
 
 @app.get("/api/kb/stats")
 def kb_stats() -> dict[str, Any]:
-    return kb.stats()
+    return require_kb().stats()
+
+
+@app.get("/api/workflow")
+def workflow() -> dict[str, Any]:
+    return require_agent().workflow_spec()
 
 
 @app.get("/api/kb/documents")
 def kb_documents() -> list[dict[str, Any]]:
-    return kb.documents()
+    return require_kb().documents()
 
 
 @app.post("/api/kb/reload")
 def reload_kb() -> dict[str, Any]:
-    kb.load()
-    return {"success": True, "kb": kb.stats()}
+    active_kb = require_kb()
+    active_kb.load()
+    return {"success": True, "kb": active_kb.stats()}
 
 
 @app.post("/api/kb/documents")
 def add_document(payload: DocumentRequest) -> dict[str, Any]:
-    filename = unique_filename(safe_filename(payload.source or payload.title), ".md")
-    target = DATA_DIR / filename
+    active_kb = require_kb()
+    content = normalize_content(payload.content)
+    resolved = resolve_document_target(DATA_DIR, payload.source or payload.title, content)
+    target = resolved.path
     header = f"# {payload.title.strip()}\n\n"
-    target.write_text(header + payload.content.strip() + "\n", encoding="utf-8")
-    kb.load()
-    return {"success": True, "document": filename, "kb": kb.stats()}
+    if not resolved.already_exists:
+        target.write_text(header + content + "\n", encoding="utf-8")
+        active_kb.load()
+    return {
+        "success": True,
+        "created": not resolved.already_exists,
+        "idempotent": resolved.already_exists,
+        "document": target.name,
+        "content_digest": resolved.digest,
+        "kb": active_kb.stats(),
+    }
 
 
 @app.post("/api/kb/upload")
 def upload_document(payload: DocumentUploadRequest) -> dict[str, Any]:
+    active_kb = require_kb()
     try:
         raw = decode_base64_payload(payload.content_base64)
+        if len(raw) > MAX_UPLOAD_BYTES:
+            raise ValueError(f"文件超过 {MAX_UPLOAD_BYTES // (1024 * 1024)}MB 限制")
         text = extract_uploaded_text(payload.filename, raw)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -114,23 +212,29 @@ def upload_document(payload: DocumentUploadRequest) -> dict[str, Any]:
         raise HTTPException(status_code=400, detail="文档内容过短或解析失败")
 
     title = payload.title or Path(payload.filename).stem
-    filename = unique_filename(safe_filename(title), ".md")
-    target = DATA_DIR / filename
-    body = f"# {title.strip()}\n\n来源文件：{payload.filename}\n\n{text.strip()}\n"
-    target.write_text(body, encoding="utf-8")
-    kb.load()
+    content = normalize_content(text)
+    resolved = resolve_document_target(DATA_DIR, title, content)
+    target = resolved.path
+    if not resolved.already_exists:
+        body = f"# {title.strip()}\n\n来源文件：{payload.filename}\n\n{content}\n"
+        target.write_text(body, encoding="utf-8")
+        active_kb.load()
     return {
         "success": True,
-        "document": filename,
+        "created": not resolved.already_exists,
+        "idempotent": resolved.already_exists,
+        "document": target.name,
+        "content_digest": resolved.digest,
         "characters": len(text),
         "warning": parse_quality_warning(payload.filename, text),
-        "kb": kb.stats(),
+        "kb": active_kb.stats(),
     }
 
 
 @app.delete("/api/kb/documents/{doc_id}")
 def delete_document(doc_id: str) -> dict[str, Any]:
-    target = kb.document_path(doc_id)
+    active_kb = require_kb()
+    target = active_kb.document_path(doc_id)
     if target is None:
         raise HTTPException(status_code=404, detail="资料不存在")
     try:
@@ -139,14 +243,54 @@ def delete_document(doc_id: str) -> dict[str, Any]:
         raise HTTPException(status_code=400, detail="非法资料路径") from exc
 
     target.unlink()
-    kb.load()
-    return {"success": True, "deleted": target.name, "kb": kb.stats()}
+    active_kb.load()
+    return {"success": True, "deleted": target.name, "kb": active_kb.stats()}
 
 
 @app.post("/api/ask")
 def ask(payload: AskRequest) -> dict[str, Any]:
-    response = agent.ask(payload.query, session_id=payload.session_id, top_k=payload.top_k)
+    active_agent = require_agent()
+    response = active_agent.ask(payload.query, session_id=payload.session_id, top_k=payload.top_k)
     return serialize_agent_response(response)
+
+
+@app.post("/api/debug/run")
+def debug_run(payload: DebugRunRequest) -> dict[str, Any]:
+    active_agent = require_agent()
+    try:
+        response = active_agent.debug_start(
+            payload.query,
+            session_id=payload.session_id,
+            top_k=payload.top_k,
+            breakpoints=payload.breakpoints,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return serialize_debug_response(response)
+
+
+@app.post("/api/debug/resume")
+def debug_resume(payload: DebugResumeRequest) -> dict[str, Any]:
+    active_agent = require_agent()
+    try:
+        response = active_agent.debug_resume(
+            payload.run_id,
+            query=payload.query,
+            breakpoints=payload.breakpoints,
+            restart=payload.restart,
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="调试运行不存在或已经结束") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return serialize_debug_response(response)
+
+
+@app.delete("/api/debug/runs/{run_id}")
+def debug_cancel(run_id: str) -> dict[str, Any]:
+    if not require_agent().cancel_debug(run_id):
+        raise HTTPException(status_code=404, detail="调试运行不存在或已经结束")
+    return {"success": True, "run_id": run_id, "status": "cancelled"}
 
 
 def serialize_agent_response(response: AgentResponse) -> dict[str, Any]:
@@ -161,6 +305,18 @@ def serialize_agent_response(response: AgentResponse) -> dict[str, Any]:
     }
 
 
+def serialize_debug_response(debug: DebugResponse) -> dict[str, Any]:
+    return {
+        **serialize_agent_response(debug.response),
+        "run_id": debug.run_id,
+        "run_status": debug.status,
+        "next_node": debug.next_node,
+        "breakpoints": debug.breakpoints,
+        "query": debug.query,
+        "workflow": require_agent().workflow_spec(),
+    }
+
+
 def serialize_tool_call(call: ToolCall) -> dict[str, Any]:
     return {
         "name": call.name,
@@ -168,21 +324,6 @@ def serialize_tool_call(call: ToolCall) -> dict[str, Any]:
         "output": call.output,
         "latency_ms": call.latency_ms,
     }
-
-
-def safe_filename(value: str) -> str:
-    cleaned = "".join(ch.lower() if ch.isalnum() else "-" for ch in value.strip())
-    cleaned = "-".join(part for part in cleaned.split("-") if part)
-    return cleaned[:80] or "document"
-
-
-def unique_filename(stem: str, suffix: str) -> str:
-    candidate = f"{stem}{suffix}"
-    index = 2
-    while (DATA_DIR / candidate).exists():
-        candidate = f"{stem}-{index}{suffix}"
-        index += 1
-    return candidate
 
 
 def decode_base64_payload(value: str) -> bytes:
@@ -225,7 +366,7 @@ def extract_docx_text(raw: bytes) -> str:
     """Extract visible text from docx, including tables and text boxes.
 
     python-docx's ``Document.paragraphs`` misses text inside tables, which is
-    common in Chinese university lab-report templates. Reading the WordprocessingML
+    common in structured technical documents. Reading the WordprocessingML
     paragraphs directly keeps those cells available for indexing.
     """
 

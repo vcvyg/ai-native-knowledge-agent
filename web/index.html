@@ -3,7 +3,7 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>AI Course Study Agent</title>
+    <title>Engineering Change Intelligence Agent</title>
     <style>
       :root {
         --bg: #f6f7f9;
@@ -238,6 +238,7 @@
         display: grid;
         gap: 14px;
         align-self: start;
+        min-width: 0;
       }
 
       .query-panel {
@@ -346,6 +347,192 @@
       .answer-panel {
         padding: 18px;
         min-height: 260px;
+      }
+
+      .graph-panel {
+        padding: 16px;
+        overflow: hidden;
+      }
+
+      .graph-header,
+      .graph-actions {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 10px;
+        flex-wrap: wrap;
+      }
+
+      .graph-status {
+        color: var(--muted);
+        font-size: 12px;
+      }
+
+      .graph-actions {
+        justify-content: flex-end;
+      }
+
+      .debug-button {
+        border: 1px solid var(--line);
+        background: #fff;
+        color: #344054;
+        border-radius: 7px;
+        min-height: 34px;
+        padding: 0 10px;
+        cursor: pointer;
+        font-weight: 700;
+        font-size: 12px;
+      }
+
+      .debug-button.primary {
+        border-color: var(--indigo);
+        background: var(--indigo);
+        color: #fff;
+      }
+
+      .debug-button.danger {
+        border-color: #ffd1da;
+        color: var(--danger);
+      }
+
+      .debug-button:disabled {
+        opacity: 0.45;
+        cursor: not-allowed;
+      }
+
+      .graph-shell {
+        margin-top: 12px;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background:
+          linear-gradient(#eef2f6 1px, transparent 1px),
+          linear-gradient(90deg, #eef2f6 1px, transparent 1px),
+          #fbfcfe;
+        background-size: 24px 24px;
+        overflow-x: auto;
+      }
+
+      #graphCanvas {
+        display: block;
+        width: 100%;
+        min-width: 780px;
+        min-height: 310px;
+      }
+
+      .graph-edge {
+        fill: none;
+        stroke: #b9c4d0;
+        stroke-width: 2;
+      }
+
+      .graph-edge.active {
+        stroke: var(--teal-2);
+        stroke-width: 3;
+      }
+
+      .graph-edge.retry {
+        stroke: #7c3aed;
+        stroke-dasharray: 6 5;
+      }
+
+      .graph-node {
+        cursor: pointer;
+      }
+
+      .graph-node rect {
+        fill: #fff;
+        stroke: #aebbc8;
+        stroke-width: 2;
+        transition: 0.18s ease;
+      }
+
+      .graph-node:hover rect {
+        stroke: var(--indigo);
+        transform: translateY(-2px);
+      }
+
+      .graph-node.completed rect {
+        fill: #ecfdf8;
+        stroke: var(--teal);
+      }
+
+      .graph-node.warning rect {
+        fill: #fffbeb;
+        stroke: var(--amber);
+      }
+
+      .graph-node.rejected rect {
+        fill: #fff7ed;
+        stroke: #ea580c;
+      }
+
+      .graph-node.retry rect {
+        fill: #f5f3ff;
+        stroke: #7c3aed;
+      }
+
+      .graph-node.failed rect {
+        fill: #fff1f3;
+        stroke: var(--danger);
+      }
+
+      .graph-node.paused rect {
+        fill: #fff7ed;
+        stroke: #ea580c;
+        stroke-width: 3;
+      }
+
+      .graph-node.breakpoint rect {
+        stroke-dasharray: 5 3;
+      }
+
+      .node-title {
+        fill: var(--ink);
+        font-size: 12px;
+        font-weight: 750;
+        pointer-events: none;
+      }
+
+      .node-meta,
+      .edge-label {
+        fill: var(--muted);
+        font-size: 10px;
+        pointer-events: none;
+      }
+
+      .breakpoint-dot {
+        fill: var(--danger);
+        stroke: #fff;
+        stroke-width: 2;
+      }
+
+      .event-strip {
+        display: flex;
+        gap: 8px;
+        overflow-x: auto;
+        padding: 12px 2px 2px;
+      }
+
+      .event-chip {
+        flex: 0 0 auto;
+        border: 1px solid var(--line);
+        border-radius: 7px;
+        padding: 7px 9px;
+        background: #fff;
+        font-size: 11px;
+        color: #475467;
+      }
+
+      .event-chip.warning { border-color: #f3cf8d; background: #fffbeb; }
+      .event-chip.rejected { border-color: #fdba74; background: #fff7ed; }
+      .event-chip.retry { border-color: #c4b5fd; background: #f5f3ff; }
+      .event-chip.failed { border-color: #fecdd3; background: #fff1f3; }
+      .event-chip.paused { border-color: #fdba74; background: #fff7ed; }
+
+      .graph-hint {
+        color: var(--muted);
+        font-size: 11px;
+        margin-top: 10px;
       }
 
       .answer-header {
@@ -459,7 +646,7 @@
         display: none;
       }
 
-      @media (max-width: 1120px) {
+      @media (max-width: 1280px) {
         .workspace {
           grid-template-columns: 240px minmax(0, 1fr);
         }
@@ -507,7 +694,7 @@
         <div class="brand">
           <div class="brand-mark">AI</div>
           <div>
-            <div class="brand-title">AI Course Study Agent</div>
+            <div class="brand-title">Engineering Change Intelligence</div>
           </div>
         </div>
         <div class="status-row">
@@ -518,7 +705,7 @@
 
       <main class="workspace">
         <aside class="panel sidebar">
-          <div class="section-title">Course Materials</div>
+          <div class="section-title">Engineering Evidence</div>
           <div class="metric-grid">
             <div class="metric">
               <div class="metric-value" id="docCount">-</div>
@@ -531,10 +718,10 @@
           </div>
           <div class="upload-card">
             <input id="fileInput" type="file" accept=".md,.txt,.pdf,.docx" hidden />
-            <button class="upload-button" id="uploadButton">上传课程资料</button>
+            <button class="upload-button" id="uploadButton">上传工程资料</button>
             <div class="doc-meta" id="uploadStatus">支持 PDF、DOCX、TXT、Markdown</div>
           </div>
-          <div class="section-title">Materials</div>
+          <div class="section-title">Evidence Sources</div>
           <div class="doc-list" id="docList"></div>
         </aside>
 
@@ -542,29 +729,50 @@
           <div class="panel query-panel">
             <div class="query-tools">
               <div class="mode-tabs" aria-label="query presets">
-                <button class="mode-tab active" data-query="帮我总结 RAG 与 Agent 的复习重点">Summary</button>
-                <button class="mode-tab" data-query="根据数据库事务和隔离级别出 5 道选择题">Quiz</button>
-                <button class="mode-tab" data-query="什么是 RAG？请结合资料解释">Q&A</button>
-                <button class="mode-tab" data-query="帮我制定三天复习计划">Plan</button>
+                <button class="mode-tab active" data-query="分析将 Reranker 切换为 Cross-Encoder 会影响哪些模块、配置和回退路径">Impact</button>
+                <button class="mode-tab" data-query="服务启动时 Embedding 模型下载超时，给出证据化诊断和恢复步骤">Incident</button>
+                <button class="mode-tab" data-query="审查这次 Cross-Encoder 变更的兼容性、停止条件和测试缺口">PR Review</button>
+                <button class="mode-tab" data-query="为低证据 Query Rewrite 设计可执行验证计划和回滚检查">Validation</button>
               </div>
             </div>
             <textarea
               class="query-box"
               id="queryInput"
               spellcheck="false"
-            >帮我总结 RAG 与 Agent 的复习重点</textarea>
+            >分析将 Reranker 切换为 Cross-Encoder 会影响哪些模块、配置和回退路径</textarea>
             <div class="action-row">
               <div class="chips">
-                <button class="chip" data-query="根据数据库事务和隔离级别出 5 道选择题">出题练习</button>
-                <button class="chip" data-query="我这部分总错，帮我做错题回顾">错题回顾</button>
-                <button class="chip" data-query="如何把 TF-IDF 替换成真实 Embedding 和向量数据库？">向量库升级</button>
+                <button class="chip" data-query="分析 Embedding 模型升级的索引兼容与迁移风险">索引迁移</button>
+                <button class="chip" data-query="Cross-Encoder 加载 OOM 时如何诊断并安全回退？">故障回退</button>
+                <button class="chip" data-query="为 Verification Loop 的重试上限设计 PR 审查清单">状态图审查</button>
               </div>
               <button class="ask-button" id="askButton">
-                <span>Ask</span>
+                <span>Run</span>
                 <span aria-hidden="true">→</span>
               </button>
             </div>
             <div class="error" id="errorBox"></div>
+          </div>
+
+          <div class="panel graph-panel">
+            <div class="graph-header">
+              <div>
+                <div class="section-title">Execution Graph</div>
+                <div class="graph-status" id="graphStatus">点击节点设置断点，或直接运行查看完整轨迹</div>
+              </div>
+              <div class="graph-actions">
+                <button class="debug-button primary" id="debugRunButton">调试运行</button>
+                <button class="debug-button" id="continueButton" disabled>继续</button>
+                <button class="debug-button" id="restartButton" disabled>应用编辑并重跑</button>
+                <button class="debug-button danger" id="cancelButton" disabled>终止</button>
+                <button class="debug-button" id="clearBreakpointsButton">清空断点</button>
+              </div>
+            </div>
+            <div class="graph-shell">
+              <svg id="graphCanvas" viewBox="0 0 900 310" role="img" aria-label="Agent execution graph"></svg>
+            </div>
+            <div class="event-strip" id="eventStrip"></div>
+            <div class="graph-hint">节点可点击设置断点。暂停后可“继续”执行当前查询，也可编辑上方问题后从 Route 重新运行。</div>
           </div>
 
           <div class="panel answer-panel">
@@ -572,7 +780,7 @@
               <div class="section-title">Answer</div>
               <div class="intent" id="intentBadge">idle</div>
             </div>
-            <div class="empty" id="emptyState">上传课程资料，或直接用样例资料体验总结、问答、出题和复习计划。</div>
+            <div class="empty" id="emptyState">上传架构文档、PR 说明、日志或 Runbook，进行有证据边界的变更分析与故障诊断。</div>
             <div class="answer" id="answerText"></div>
           </div>
         </section>
@@ -597,6 +805,11 @@
       const state = {
         sessionId: localStorage.getItem("agent_session_id") || null,
         busy: false,
+        workflow: null,
+        breakpoints: new Set(),
+        debugRunId: null,
+        pausedQuery: null,
+        lastRun: null,
       };
 
       const queryInput = document.getElementById("queryInput");
@@ -611,6 +824,14 @@
       const trace = document.getElementById("trace");
       const runtime = document.getElementById("runtime");
       const errorBox = document.getElementById("errorBox");
+      const graphCanvas = document.getElementById("graphCanvas");
+      const graphStatus = document.getElementById("graphStatus");
+      const eventStrip = document.getElementById("eventStrip");
+      const debugRunButton = document.getElementById("debugRunButton");
+      const continueButton = document.getElementById("continueButton");
+      const restartButton = document.getElementById("restartButton");
+      const cancelButton = document.getElementById("cancelButton");
+      const clearBreakpointsButton = document.getElementById("clearBreakpointsButton");
 
       document.querySelectorAll("[data-query]").forEach((button) => {
         button.addEventListener("click", () => {
@@ -622,6 +843,14 @@
       });
 
       askButton.addEventListener("click", ask);
+      debugRunButton.addEventListener("click", debugRun);
+      continueButton.addEventListener("click", () => resumeDebug(false));
+      restartButton.addEventListener("click", () => resumeDebug(true));
+      cancelButton.addEventListener("click", cancelDebug);
+      clearBreakpointsButton.addEventListener("click", () => {
+        state.breakpoints.clear();
+        renderGraph(state.lastRun);
+      });
       uploadButton.addEventListener("click", () => fileInput.click());
       fileInput.addEventListener("change", uploadMaterial);
       document.getElementById("docList").addEventListener("click", (event) => {
@@ -637,14 +866,30 @@
         try {
           const response = await fetch("/api/health");
           const data = await response.json();
-          document.getElementById("statusDot").classList.add("ok");
-          document.getElementById("statusText").textContent = "Service online";
+          const statusDot = document.getElementById("statusDot");
+          const statusText = document.getElementById("statusText");
+          if (data.status === "initializing") {
+            statusDot.classList.remove("ok");
+            statusText.textContent = "Initializing knowledge base…";
+            setTimeout(loadHealth, 5000);
+            return;
+          }
+          statusDot.classList.add("ok");
+          statusText.textContent = "Service online";
           document.getElementById("docCount").textContent = data.kb.documents;
           document.getElementById("chunkCount").textContent = data.kb.chunks;
+          await loadWorkflow();
           await loadDocuments();
         } catch (error) {
           document.getElementById("statusText").textContent = "Service unavailable";
         }
+      }
+
+      async function loadWorkflow() {
+        const response = await fetch("/api/workflow");
+        if (!response.ok) throw new Error(await response.text());
+        state.workflow = await response.json();
+        renderGraph(state.lastRun);
       }
 
       async function uploadMaterial() {
@@ -667,16 +912,18 @@
           });
           if (!response.ok) throw new Error(await response.text());
           const data = await response.json();
-          uploadStatus.textContent = data.warning
-            ? `已加入知识库：${data.document}，但${data.warning}`
-            : `已加入知识库：${data.document}`;
+          uploadStatus.textContent = data.idempotent
+            ? `内容已存在，复用：${data.document}`
+            : data.warning
+              ? `已加入知识库：${data.document}，但${data.warning}`
+              : `已加入知识库：${data.document}`;
           await loadHealth();
         } catch (error) {
           uploadStatus.textContent = "上传失败";
           showError(error.message || String(error));
         } finally {
           uploadButton.disabled = false;
-          uploadButton.textContent = "上传课程资料";
+          uploadButton.textContent = "上传工程资料";
           fileInput.value = "";
         }
       }
@@ -754,6 +1001,8 @@
           const data = await response.json();
           state.sessionId = data.session_id;
           localStorage.setItem("agent_session_id", data.session_id);
+          state.debugRunId = null;
+          state.pausedQuery = null;
           renderAnswer(data);
         } catch (error) {
           showError(error.message || String(error));
@@ -762,19 +1011,125 @@
         }
       }
 
+      async function debugRun() {
+        if (state.busy) return;
+        const query = queryInput.value.trim();
+        if (!query) return;
+        setBusy(true);
+        hideError();
+        try {
+          if (state.debugRunId) await cancelDebugRequest(state.debugRunId, false);
+          const response = await fetch("/api/debug/run", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              query,
+              session_id: state.sessionId,
+              top_k: 6,
+              breakpoints: [...state.breakpoints],
+            }),
+          });
+          if (!response.ok) throw new Error(await response.text());
+          handleDebugResponse(await response.json());
+        } catch (error) {
+          showError(error.message || String(error));
+        } finally {
+          setBusy(false);
+        }
+      }
+
+      async function resumeDebug(restart) {
+        if (state.busy || !state.debugRunId) return;
+        const query = queryInput.value.trim();
+        if (!query) return;
+        if (!restart && query !== state.pausedQuery) {
+          showError("问题已被编辑。请选择“应用编辑并重跑”，从 Route 重新计算状态。 ");
+          return;
+        }
+        setBusy(true);
+        hideError();
+        try {
+          const response = await fetch("/api/debug/resume", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              run_id: state.debugRunId,
+              query,
+              breakpoints: [...state.breakpoints],
+              restart,
+            }),
+          });
+          if (!response.ok) throw new Error(await response.text());
+          handleDebugResponse(await response.json());
+        } catch (error) {
+          showError(error.message || String(error));
+        } finally {
+          setBusy(false);
+        }
+      }
+
+      async function cancelDebug() {
+        if (!state.debugRunId || state.busy) return;
+        setBusy(true);
+        hideError();
+        try {
+          await cancelDebugRequest(state.debugRunId, true);
+        } catch (error) {
+          showError(error.message || String(error));
+        } finally {
+          setBusy(false);
+        }
+      }
+
+      async function cancelDebugRequest(runId, updateUi) {
+        const response = await fetch(`/api/debug/runs/${encodeURIComponent(runId)}`, {
+          method: "DELETE",
+        });
+        if (!response.ok && response.status !== 404) throw new Error(await response.text());
+        if (updateUi) {
+          state.debugRunId = null;
+          state.pausedQuery = null;
+          updateDebugControls("cancelled", null);
+          graphStatus.textContent = "调试运行已终止，可修改问题或断点后重新运行";
+        }
+      }
+
+      function handleDebugResponse(data) {
+        state.sessionId = data.session_id;
+        localStorage.setItem("agent_session_id", data.session_id);
+        state.debugRunId = data.run_status === "paused" ? data.run_id : null;
+        state.pausedQuery = data.run_status === "paused" ? data.query : null;
+        state.workflow = data.workflow || state.workflow;
+        renderAnswer(data);
+        updateDebugControls(data.run_status, data.next_node);
+      }
+
       function renderAnswer(data) {
-        emptyState.style.display = "none";
-        answerText.textContent = data.answer;
+        state.lastRun = data;
+        const paused = data.run_status === "paused" || data.metrics.run_status === "paused";
+        emptyState.style.display = data.answer ? "none" : "grid";
+        emptyState.textContent = paused
+          ? `已在 ${data.next_node || data.metrics.next_node} 节点前暂停。可检查状态、继续运行，或修改问题后从头重跑。`
+          : "本次运行没有生成答案。";
+        answerText.textContent = data.answer || "";
         intentBadge.textContent = data.intent;
         runtime.innerHTML = `
           <div class="runtime-row"><span>Latency</span><strong>${data.metrics.latency_ms} ms</strong></div>
           <div class="runtime-row"><span>Retrieved</span><strong>${data.metrics.retrieved_chunks}</strong></div>
           <div class="runtime-row"><span>Router</span><strong>${data.metrics.router_confidence}</strong></div>
           <div class="runtime-row"><span>Vector DB</span><strong>${escapeHtml(data.metrics.vector_backend)}</strong></div>
+          <div class="runtime-row"><span>Embedding</span><strong>${escapeHtml(data.metrics.embedding_model)}</strong></div>
+          <div class="runtime-row"><span>Dimensions</span><strong>${data.metrics.embedding_dimensions}</strong></div>
+          <div class="runtime-row"><span>Reranker</span><strong>${escapeHtml(data.metrics.reranker)}</strong></div>
+          <div class="runtime-row"><span>Fallback</span><strong>${escapeHtml(data.metrics.vector_backend_error || data.metrics.reranker_error || "none")}</strong></div>
+          <div class="runtime-row"><span>Retries</span><strong>${data.metrics.retrieval_attempts - 1}</strong></div>
+          <div class="runtime-row"><span>Stop reason</span><strong>${escapeHtml(data.metrics.stop_reason)}</strong></div>
+          <div class="runtime-row"><span>Graph path</span><strong>${escapeHtml(data.metrics.graph_path.join(" → "))}</strong></div>
           <div class="runtime-row"><span>LLM Mode</span><strong>${escapeHtml(data.metrics.llm_mode)}</strong></div>
         `;
         citations.innerHTML = data.citations.map(renderCitation).join("");
         trace.innerHTML = data.trace.map(renderTrace).join("");
+        renderGraph(data);
       }
 
       function renderCitation(item) {
@@ -802,10 +1157,156 @@
         `;
       }
 
+      function renderGraph(data) {
+        if (!state.workflow) return;
+        const positions = {
+          route: [55, 105],
+          retrieve: [210, 105],
+          verify_evidence: [375, 105],
+          execute_tools: [560, 105],
+          synthesize: [730, 105],
+          rewrite_query: [375, 225],
+        };
+        const labels = {
+          route: "Route",
+          retrieve: "Retrieve + Rerank",
+          verify_evidence: "Verify Evidence",
+          rewrite_query: "Rewrite Query",
+          execute_tools: "Execute Tools",
+          synthesize: "Synthesize",
+        };
+        const events = (data && data.metrics && data.metrics.graph_events) || [];
+        const path = (data && data.metrics && data.metrics.graph_path) || [];
+        const pairs = new Set(path.slice(0, -1).map((node, index) => `${node}|${path[index + 1]}`));
+        const eventGroups = {};
+        events.forEach((event) => {
+          (eventGroups[event.node] ||= []).push(event);
+        });
+
+        const edgeDefinitions = [
+          ["route", "retrieve", "M 175 137 L 210 137", ""],
+          ["retrieve", "verify_evidence", "M 340 137 L 375 137", ""],
+          ["verify_evidence", "execute_tools", "M 515 137 L 560 137", "ok / limit"],
+          ["execute_tools", "synthesize", "M 690 137 L 730 137", ""],
+          ["verify_evidence", "rewrite_query", "M 445 169 L 445 225", "low evidence"],
+          ["rewrite_query", "retrieve", "M 375 257 C 310 290 250 270 275 169", "retry"],
+        ];
+        const edges = edgeDefinitions
+          .map(([source, target, shape, label]) => {
+            const active = pairs.has(`${source}|${target}`);
+            const retry = source === "rewrite_query";
+            const labelMarkup = label
+              ? `<text class="edge-label" x="${source === "verify_evidence" && target === "rewrite_query" ? 452 : source === "rewrite_query" ? 285 : 520}" y="${source === "verify_evidence" && target === "rewrite_query" ? 201 : source === "rewrite_query" ? 283 : 126}">${escapeHtml(label)}</text>`
+              : "";
+            return `<path class="graph-edge ${active ? "active" : ""} ${retry && active ? "retry" : ""}" d="${shape}" marker-end="url(#arrow)" />${labelMarkup}`;
+          })
+          .join("");
+
+        const nodes = state.workflow.nodes
+          .map((node) => {
+            const [x, y] = positions[node];
+            const nodeEvents = eventGroups[node] || [];
+            const latest = nodeEvents[nodeEvents.length - 1];
+            let status = latest ? latest.status : "pending";
+            if (node === "retrieve" && data && data.metrics && (data.metrics.vector_backend_error || data.metrics.reranker_error)) {
+              status = "warning";
+            }
+            const count = nodeEvents.filter((event) => event.status !== "paused").length;
+            const breakpoint = state.breakpoints.has(node);
+            const meta = latest
+              ? `${status}${count > 1 ? ` ×${count}` : ""} · ${latest.latency_ms}ms`
+              : breakpoint ? "breakpoint" : "not executed";
+            return `
+              <g class="graph-node ${status} ${breakpoint ? "breakpoint" : ""}" data-node="${node}" transform="translate(${x}, ${y})">
+                <rect width="130" height="64" rx="9"></rect>
+                <text class="node-title" x="65" y="27" text-anchor="middle">${escapeHtml(labels[node] || node)}</text>
+                <text class="node-meta" x="65" y="46" text-anchor="middle">${escapeHtml(meta)}</text>
+                ${breakpoint ? '<circle class="breakpoint-dot" cx="119" cy="10" r="7"></circle>' : ""}
+              </g>
+            `;
+          })
+          .join("");
+
+        graphCanvas.innerHTML = `
+          <defs>
+            <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+              <path d="M 0 0 L 10 5 L 0 10 z" fill="#91a0af"></path>
+            </marker>
+          </defs>
+          ${edges}
+          ${nodes}
+        `;
+        graphCanvas.querySelectorAll("[data-node]").forEach((element) => {
+          element.addEventListener("click", () => toggleBreakpoint(element.dataset.node));
+        });
+        renderEventStrip(data, events);
+
+        if (data) {
+          const runStatus = data.run_status || data.metrics.run_status;
+          if (runStatus === "paused") {
+            graphStatus.textContent = `断点暂停：下一节点 ${data.next_node || data.metrics.next_node}`;
+          } else {
+            graphStatus.textContent = `运行完成：${data.metrics.stop_reason || "completed"} · ${path.length} 个节点跳转`;
+          }
+        } else {
+          graphStatus.textContent = state.breakpoints.size
+            ? `已设置 ${state.breakpoints.size} 个断点，点击“调试运行”`
+            : "点击节点设置断点，或直接运行查看完整轨迹";
+        }
+      }
+
+      function renderEventStrip(data, graphEvents) {
+        const toolEvents = (data && data.trace) || [];
+        const graphItems = graphEvents.map((event) => ({
+          label: `${event.sequence}. ${event.node}`,
+          meta: event.status,
+          status: event.status,
+        }));
+        const toolItems = toolEvents.map((item) => {
+          let status = "completed";
+          let meta = `${item.latency_ms}ms`;
+          if (item.name === "query_rewrite") status = "retry";
+          if (item.name === "evidence_verifier" && item.output.quality === "low") status = "rejected";
+          if (item.output && item.output.fallback_error) {
+            status = "warning";
+            meta = "fallback";
+          }
+          return { label: `tool · ${item.name}`, meta, status };
+        });
+        const fallbackItems = [];
+        if (data && data.metrics && data.metrics.vector_backend_error) {
+          fallbackItems.push({ label: "fallback · vector store", meta: data.metrics.vector_backend_error, status: "warning" });
+        }
+        if (data && data.metrics && data.metrics.reranker_error) {
+          fallbackItems.push({ label: "fallback · reranker", meta: data.metrics.reranker_error, status: "warning" });
+        }
+        const items = [...graphItems, ...toolItems, ...fallbackItems];
+        eventStrip.innerHTML = items.length
+          ? items.map((item) => `<div class="event-chip ${item.status}">${escapeHtml(item.label)} · ${escapeHtml(item.meta)}</div>`).join("")
+          : '<div class="graph-hint">运行后这里会按顺序显示节点和工具事件。</div>';
+      }
+
+      function toggleBreakpoint(node) {
+        if (state.busy) return;
+        if (state.breakpoints.has(node)) state.breakpoints.delete(node);
+        else state.breakpoints.add(node);
+        renderGraph(state.lastRun);
+      }
+
+      function updateDebugControls(status, nextNode) {
+        const paused = status === "paused" && Boolean(state.debugRunId);
+        continueButton.disabled = !paused || state.busy;
+        restartButton.disabled = !paused || state.busy;
+        cancelButton.disabled = !paused || state.busy;
+        if (paused) graphStatus.textContent = `断点暂停：下一节点 ${nextNode}`;
+      }
+
       function setBusy(value) {
         state.busy = value;
         askButton.disabled = value;
-        askButton.querySelector("span").textContent = value ? "Thinking" : "Ask";
+        debugRunButton.disabled = value;
+        askButton.querySelector("span").textContent = value ? "Running" : "Run";
+        updateDebugControls(state.debugRunId ? "paused" : "idle", state.lastRun && state.lastRun.next_node);
       }
 
       function readFileAsDataUrl(file) {

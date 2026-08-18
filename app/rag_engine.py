@@ -1,17 +1,18 @@
 from __future__ import annotations
 
-import re
-import time
 import os
+import re
+import threading
+import time
 from dataclasses import asdict, dataclass
 from hashlib import sha1
 from pathlib import Path
 from typing import Any
 
 import numpy as np
-from sklearn.feature_extraction.text import HashingVectorizer, TfidfVectorizer
-from sklearn.metrics.pairwise import cosine_similarity
 
+from .embeddings import EmbeddingProvider, build_embedding_provider
+from .rerankers import build_reranker
 
 SUPPORTED_EXTENSIONS = {".md", ".txt"}
 
@@ -54,127 +55,156 @@ class VectorCandidate:
     vector_score: float
 
 
-class TfidfVectorStore:
-    """Zero-config vector backend for local demos and CI."""
+class DenseVectorStore:
+    """In-memory cosine search over real dense document embeddings.
 
-    name = "tfidf_local"
+    ``build`` reuses embeddings cached by ``chunk.id`` when ``reuse_ids`` is
+    given, so reloads only encode the delta (new or changed documents) instead
+    of re-encoding the whole corpus.
+    """
 
-    def __init__(self) -> None:
-        self._char_vectorizer: TfidfVectorizer | None = None
-        self._word_vectorizer: TfidfVectorizer | None = None
-        self._char_matrix = None
-        self._word_matrix = None
+    def __init__(self, embeddings: EmbeddingProvider) -> None:
+        self.embeddings = embeddings
+        self.name = f"dense_memory:{embeddings.name}"
+        self.matrix = np.empty((0, 0), dtype=np.float32)
+        self._rows_by_id: dict[str, np.ndarray] = {}
 
-    def build(self, chunks: list[Chunk], index_views: list["_IndexView"]) -> None:
-        corpus = [view.text_for_index for view in index_views]
-        if not corpus:
-            self._char_vectorizer = None
-            self._word_vectorizer = None
-            self._char_matrix = None
-            self._word_matrix = None
+    def build(
+        self,
+        chunks: list[Chunk],
+        index_views: list["_IndexView"],
+        reuse_ids: set[str] | None = None,
+    ) -> None:
+        rows: list[np.ndarray | None] = [None] * len(chunks)
+        to_encode: list[tuple[int, str]] = []
+        for idx, (chunk, view) in enumerate(zip(chunks, index_views)):
+            if reuse_ids and chunk.id in reuse_ids:
+                cached = self._rows_by_id.get(chunk.id)
+                if cached is not None:
+                    rows[idx] = cached
+                    continue
+            to_encode.append((idx, view.text_for_index))
+        if to_encode:
+            encoded = self.embeddings.encode_documents([text for _, text in to_encode])
+            for (idx, _), row in zip(to_encode, encoded):
+                rows[idx] = row
+        if not rows:
+            self.matrix = np.empty((0, 0), dtype=np.float32)
+            self._rows_by_id = {}
             return
-
-        self._char_vectorizer = TfidfVectorizer(
-            analyzer="char",
-            ngram_range=(2, 4),
-            min_df=1,
-            sublinear_tf=True,
-            norm="l2",
-        )
-        self._word_vectorizer = TfidfVectorizer(
-            analyzer="word",
-            token_pattern=r"(?u)\b[\w\-]+\b",
-            ngram_range=(1, 2),
-            lowercase=True,
-            min_df=1,
-            sublinear_tf=True,
-            norm="l2",
-        )
-        self._char_matrix = self._char_vectorizer.fit_transform(corpus)
-        self._word_matrix = self._word_vectorizer.fit_transform(corpus)
+        filled = [row for row in rows if row is not None]
+        if len(filled) != len(rows):
+            raise RuntimeError("dense index rows do not match chunks after build")
+        self.matrix = np.vstack(filled).astype(np.float32)
+        self._rows_by_id = {chunk.id: self.matrix[i] for i, chunk in enumerate(chunks)}
 
     def search(self, query: str, top_n: int) -> list[VectorCandidate]:
-        if not self._char_vectorizer or self._char_matrix is None:
+        if self.matrix.size == 0:
             return []
-
-        q_char = self._char_vectorizer.transform([query])
-        char_scores = cosine_similarity(q_char, self._char_matrix).ravel()
-
-        if self._word_vectorizer and self._word_matrix is not None:
-            q_word = self._word_vectorizer.transform([query])
-            word_scores = cosine_similarity(q_word, self._word_matrix).ravel()
-        else:
-            word_scores = np.zeros(len(char_scores))
-
-        candidates = [
-            VectorCandidate(
-                chunk_index=idx,
-                vector_score=0.68 * float(char_scores[idx]) + 0.32 * float(word_scores[idx]),
-            )
-            for idx in range(len(char_scores))
+        query_vector = self.embeddings.encode_queries([query])[0]
+        scores = self.matrix @ query_vector
+        indices = np.argsort(scores)[::-1][:top_n]
+        return [
+            VectorCandidate(chunk_index=int(index), vector_score=max(0.0, float(scores[index])))
+            for index in indices
         ]
-        candidates.sort(key=lambda item: item.vector_score, reverse=True)
-        return candidates[:top_n]
 
 
 class ChromaVectorStore:
-    """Persistent vector database backend.
+    """Persistent Chroma index populated with the same real dense embeddings.
 
-    Chroma is used when ``AI_AGENT_VECTOR_BACKEND=chroma`` or when the default
-    ``auto`` mode finds chromadb installed. A fixed-size HashingVectorizer keeps
-    the backend self-contained for a student demo; swapping it for bge/OpenAI
-    embeddings only requires changing the embedding function here.
+    ``build`` upserts only new/changed chunks and deletes stale ids instead of
+    dropping and recreating the whole collection, so reloads are incremental.
+    The collection is tagged with the embedding model so a model change forces
+    a full rebuild instead of mixing incompatible vectors.
     """
 
-    name = "chroma_hashing"
-
-    def __init__(self, persist_dir: Path):
+    def __init__(self, persist_dir: Path, embeddings: EmbeddingProvider):
         self.persist_dir = persist_dir
-        self.collection = None
+        self.embeddings = embeddings
+        self.name = f"chroma:{embeddings.name}"
+        self.collection: Any = None  # lazy chromadb.Collection, loaded in build()
         self.chunk_count = 0
-        self.vectorizer = HashingVectorizer(
-            analyzer="char_wb",
-            ngram_range=(2, 5),
-            n_features=768,
-            alternate_sign=False,
-            norm="l2",
-        )
 
-    def build(self, chunks: list[Chunk], index_views: list["_IndexView"]) -> None:
+    def build(
+        self,
+        chunks: list[Chunk],
+        index_views: list["_IndexView"],
+        reuse_ids: set[str] | None = None,
+    ) -> None:
         import chromadb
 
         self.persist_dir.mkdir(parents=True, exist_ok=True)
         client = chromadb.PersistentClient(path=str(self.persist_dir))
-        collection_name = "course_chunks"
+        collection_name = "engineering_evidence"
+        model_tag = f"{self.embeddings.name}:{self.embeddings.dimensions}"
         try:
-            client.delete_collection(collection_name)
+            collection = client.get_collection(name=collection_name)
+            if (collection.metadata or {}).get("model") != model_tag:
+                client.delete_collection(collection_name)
+                collection = client.create_collection(
+                    name=collection_name,
+                    metadata={"hnsw:space": "cosine", "model": model_tag},
+                )
         except Exception:
-            pass
-
-        self.collection = client.create_collection(
-            name=collection_name,
-            metadata={"hnsw:space": "cosine"},
-        )
+            collection = client.create_collection(
+                name=collection_name,
+                metadata={"hnsw:space": "cosine", "model": model_tag},
+            )
+        self.collection = collection
         self.chunk_count = len(chunks)
-        if not chunks:
-            return
 
-        corpus = [view.text_for_index for view in index_views]
-        embeddings = self.vectorizer.transform(corpus).toarray().astype("float32").tolist()
-        ids = [f"{chunk.id}-{idx}" for idx, chunk in enumerate(chunks)]
-        metadatas = [{"chunk_index": idx, "source": chunk.source} for idx, chunk in enumerate(chunks)]
-        self.collection.add(
-            ids=ids,
-            documents=corpus,
-            embeddings=embeddings,
-            metadatas=metadatas,
-        )
+        view_by_id = {chunk.id: view.text_for_index for chunk, view in zip(chunks, index_views)}
+        index_by_id = {chunk.id: idx for idx, chunk in enumerate(chunks)}
+        source_by_id = {chunk.id: chunk.source for chunk in chunks}
+
+        existing_ids = set(collection.get(include=[])["ids"])
+        target_ids = {chunk.id for chunk in chunks}
+
+        stale = existing_ids - target_ids
+        if stale:
+            collection.delete(ids=list(stale))
+
+        # Unchanged chunks already persisted: refresh only the index metadata
+        # because positions shift when other documents are added or removed.
+        keep_ids = [
+            chunk.id
+            for chunk in chunks
+            if chunk.id in existing_ids and reuse_ids and chunk.id in reuse_ids
+        ]
+        if keep_ids:
+            collection.update(
+                ids=keep_ids,
+                metadatas=[
+                    {"chunk_index": index_by_id[cid], "source": source_by_id[cid]}
+                    for cid in keep_ids
+                ],
+            )
+
+        # New chunks and chunks of changed documents are encoded as a delta.
+        encode_chunks = [
+            chunk
+            for chunk in chunks
+            if chunk.id not in existing_ids or not (reuse_ids and chunk.id in reuse_ids)
+        ]
+        if encode_chunks:
+            corpus = [view_by_id[chunk.id] for chunk in encode_chunks]
+            embeddings = self.embeddings.encode_documents(corpus).tolist()
+            collection.upsert(
+                ids=[chunk.id for chunk in encode_chunks],
+                documents=corpus,
+                embeddings=embeddings,
+                metadatas=[
+                    {"chunk_index": index_by_id[chunk.id], "source": chunk.source}
+                    for chunk in encode_chunks
+                ],
+            )
 
     def search(self, query: str, top_n: int) -> list[VectorCandidate]:
         if self.collection is None or self.chunk_count == 0:
             return []
 
-        embedding = self.vectorizer.transform([query]).toarray().astype("float32")[0].tolist()
+        embedding = self.embeddings.encode_queries([query])[0].tolist()
         result = self.collection.query(
             query_embeddings=[embedding],
             n_results=min(top_n, self.chunk_count),
@@ -191,57 +221,119 @@ class ChromaVectorStore:
 
 
 class KnowledgeBase:
-    """Course-material RAG engine with swappable vector store backends."""
+    """Engineering-evidence RAG engine with swappable vector store backends."""
 
     def __init__(self, data_dir: Path):
         self.data_dir = data_dir
         self.chunks: list[Chunk] = []
+        self.embedding_provider = build_embedding_provider()
         self.vector_store = self._select_vector_store()
+        self.reranker = build_reranker()
         self.vector_backend_error: str | None = None
         self.last_loaded_at = 0.0
+        self._lock = threading.Lock()
+        self._stats_cache: dict[str, Any] | None = None
+        self._file_snapshots: dict[str, str] = {}
+        self._ready = False
         self.load()
 
+    @property
+    def ready(self) -> bool:
+        with self._lock:
+            return self._ready
+
     def _select_vector_store(self):
-        preference = os.getenv("AI_AGENT_VECTOR_BACKEND", "auto").strip().lower()
-        if preference in {"auto", "chroma"}:
-            return ChromaVectorStore(self.data_dir.parent / "vector_store" / "chroma")
-        return TfidfVectorStore()
+        preference = os.getenv("AI_AGENT_VECTOR_BACKEND", "memory").strip().lower()
+        if preference == "chroma":
+            return ChromaVectorStore(
+                self.data_dir.parent / "vector_store" / "chroma",
+                self.embedding_provider,
+            )
+        if preference not in {"memory", "dense", "auto"}:
+            raise ValueError(
+                "AI_AGENT_VECTOR_BACKEND must be memory or chroma"
+            )
+        return DenseVectorStore(self.embedding_provider)
 
     def load(self) -> None:
+        with self._lock:
+            self._reload_locked()
+
+    def _reload_locked(self) -> None:
         self.data_dir.mkdir(parents=True, exist_ok=True)
-        self.chunks = []
+        files: dict[str, str] = {}
         for file_path in sorted(self.data_dir.rglob("*")):
             if file_path.suffix.lower() not in SUPPORTED_EXTENSIONS:
                 continue
-            text = file_path.read_text(encoding="utf-8", errors="ignore")
-            self.chunks.extend(chunk_document(file_path, text))
+            files[str(file_path)] = _file_digest(file_path)
 
-        index_views = _chunk_index_views(self.chunks)
+        changed_paths = {
+            path for path, digest in files.items() if self._file_snapshots.get(path) != digest
+        }
+        removed_paths = set(self._file_snapshots) - set(files)
+        if not changed_paths and not removed_paths and self._ready:
+            return  # nothing changed; keep the existing index untouched
+
+        chunks: list[Chunk] = []
+        changed_doc_ids: set[str] = set()
+        for path in sorted(files):
+            text = Path(path).read_text(encoding="utf-8", errors="ignore")
+            file_chunks = chunk_document(Path(path), text)
+            if path in changed_paths:
+                changed_doc_ids.update(chunk.doc_id for chunk in file_chunks)
+            chunks.extend(file_chunks)
+
+        # Chunks from untouched documents keep their previous embeddings; only
+        # the delta (new or changed documents) is re-encoded.
+        reuse_ids = {chunk.id for chunk in chunks if chunk.doc_id not in changed_doc_ids}
+        index_views = _chunk_index_views(chunks)
         try:
             self.vector_backend_error = None
-            self.vector_store.build(self.chunks, index_views)
+            self.vector_store.build(chunks, index_views, reuse_ids=reuse_ids)
         except Exception as exc:
             self.vector_backend_error = f"{type(exc).__name__}: {exc}"
-            self.vector_store = TfidfVectorStore()
-            self.vector_store.build(self.chunks, index_views)
+            if isinstance(self.vector_store, DenseVectorStore):
+                raise
+            self.vector_store = DenseVectorStore(self.embedding_provider)
+            self.vector_store.build(chunks, index_views)
+        self.chunks = chunks
+        self._file_snapshots = files
         self.last_loaded_at = time.time()
+        self._stats_cache = None
+        self._ready = True
 
     def stats(self) -> dict[str, Any]:
-        doc_ids = {c.doc_id for c in self.chunks}
-        sections = {c.section for c in self.chunks}
-        return {
-            "documents": len(doc_ids),
-            "chunks": len(self.chunks),
-            "sections": len(sections),
-            "data_dir": str(self.data_dir),
-            "last_loaded_at": self.last_loaded_at,
-            "vector_backend": self.vector_store.name,
-            "vector_backend_error": self.vector_backend_error,
-        }
+        with self._lock:
+            if self._stats_cache is None:
+                doc_ids = {c.doc_id for c in self.chunks}
+                sections = {c.section for c in self.chunks}
+                self._stats_cache = {
+                    "documents": len(doc_ids),
+                    "chunks": len(self.chunks),
+                    "sections": len(sections),
+                    "data_dir": str(self.data_dir),
+                    "last_loaded_at": self.last_loaded_at,
+                    "embedding_model": self.embedding_provider.name,
+                    "embedding_dimensions": self.embedding_provider.dimensions,
+                }
+            # Runtime state is always read live so a mid-flight reranker
+            # fallback is still reflected even when the doc stats are cached.
+            return {
+                **self._stats_cache,
+                "vector_backend": self.vector_store.name,
+                "vector_backend_error": self.vector_backend_error,
+                "reranker_requested": self.reranker.requested_name,
+                "reranker": self.reranker.name,
+                "reranker_error": self.reranker.last_error,
+                "reranker_degraded": self.reranker.degraded,
+                "reranker_fallback_count": self.reranker.fallback_count,
+            }
 
     def documents(self) -> list[dict[str, Any]]:
+        with self._lock:
+            chunks = self.chunks
         grouped: dict[str, dict[str, Any]] = {}
-        for chunk in self.chunks:
+        for chunk in chunks:
             item = grouped.setdefault(
                 chunk.doc_id,
                 {
@@ -270,45 +362,60 @@ class KnowledgeBase:
         return None
 
     def search(self, query: str, top_k: int = 6) -> list[SearchHit]:
-        if not self.chunks:
+        # Snapshot the mutable index under the lock so a concurrent reload
+        # cannot swap chunks/vector_store mid-search (index-out-of-range).
+        with self._lock:
+            chunks = self.chunks
+            vector_store = self.vector_store
+        if not chunks:
             return []
 
         expanded_query = expand_query(query)
-        vector_candidates = self.vector_store.search(expanded_query, top_n=max(top_k * 4, 24))
-        candidate_scores = {
-            candidate.chunk_index: candidate.vector_score for candidate in vector_candidates
-        }
+        vector_candidates = vector_store.search(expanded_query, top_n=max(top_k * 4, 24))
         query_terms = extract_terms(expanded_query)
 
-        # Keep exact terms in the candidate pool so IDs, names, and short
-        # professional nouns are not lost by pure vector similarity.
-        for idx, chunk in enumerate(self.chunks):
+        # Single pass over the corpus: compute keyword/title scores once and
+        # keep every chunk that is a vector candidate or has a direct term hit.
+        scored: dict[int, tuple[float, float]] = {}
+        for idx, chunk in enumerate(chunks):
             keyword_score = keyword_overlap(query_terms, chunk.text)
             title_score = title_overlap(query_terms, f"{chunk.title} {chunk.section}")
             if keyword_score > 0 or title_score > 0:
-                candidate_scores.setdefault(idx, 0.0)
+                scored[idx] = (keyword_score, title_score)
 
-        if not candidate_scores:
+        vector_scores = {c.chunk_index: c.vector_score for c in vector_candidates}
+        if not scored and not vector_scores:
             return []
 
         hits: list[SearchHit] = []
-        for idx, vector_score in candidate_scores.items():
-            chunk = self.chunks[idx]
-            keyword_score = keyword_overlap(query_terms, chunk.text)
-            title_score = title_overlap(query_terms, f"{chunk.title} {chunk.section}")
+        for idx, vector_score in vector_scores.items():
+            keyword_score, title_score = scored.get(idx, (0.0, 0.0))
             score = 0.72 * vector_score + 0.20 * keyword_score + 0.08 * title_score
             hits.append(
                 SearchHit(
-                    chunk=chunk,
+                    chunk=chunks[idx],
                     score=score,
                     vector_score=vector_score,
                     keyword_score=keyword_score,
                     title_score=title_score,
                 )
             )
+        # Chunks matched only by exact terms still join the pool with a zero
+        # vector score, mirroring the previous candidate-set behaviour.
+        for idx, (keyword_score, title_score) in scored.items():
+            if idx not in vector_scores:
+                hits.append(
+                    SearchHit(
+                        chunk=chunks[idx],
+                        score=0.20 * keyword_score + 0.08 * title_score,
+                        vector_score=0.0,
+                        keyword_score=keyword_score,
+                        title_score=title_score,
+                    )
+                )
 
         hits.sort(key=lambda h: h.score, reverse=True)
-        return rerank_hits(query, hits[: max(top_k * 3, 10)])[:top_k]
+        return self.reranker.rerank(query, hits[: max(top_k * 3, 10)])[:top_k]
 
 
 @dataclass
@@ -372,6 +479,11 @@ def stable_doc_id(file_path: Path) -> str:
     return f"doc-{sha1(file_path.name.encode('utf-8')).hexdigest()[:10]}"
 
 
+def _file_digest(file_path: Path) -> str:
+    """Content hash used to detect changed documents for incremental reloads."""
+    return sha1(file_path.read_bytes()).hexdigest()
+
+
 def split_sections(text: str) -> list[tuple[str, str]]:
     lines = text.splitlines()
     sections: list[tuple[str, list[str]]] = []
@@ -430,16 +542,21 @@ def expand_query(query: str) -> str:
         "大模型": "LLM 生成 回答 OpenAI DeepSeek Qwen 混元",
         "prompt": "提示词 Prompt 工程 输出结构 约束 示例",
         "知识库": "文档 资料 chunk 分段 metadata source citation",
-        "出题": "选择题 判断题 练习题 自测 题干 选项 答案 解析",
-        "选择题": "出题 练习题 自测 题干 选项 答案 解析",
-        "简历": "岗位 匹配 项目亮点 负责内容 技术栈 成果",
-        "腾讯": "AI原生工程师 产品业务 系统开发 Agent RAG",
+        "变更": "影响面 调用方 兼容性 状态 数据 依赖 回滚",
+        "故障": "日志 原始错误 失败阶段 根因假设 重试 回退 恢复",
+        "审查": "PR review 风险 测试缺口 错误处理 兼容性",
+        "验证": "baseline oracle 测试 故障注入 停止条件 回滚",
         "部署": "FastAPI 前端 服务 API Docker screen uvicorn",
     }
     text = query
     lower = query.lower()
     for key, value in expansions.items():
-        if key.lower() in lower or key in query:
+        if key.isascii() and key.isalpha():
+            # Word-boundary match for ASCII keys: "rag" must not fire on
+            # substrings like "storage" or "coverage".
+            if re.search(rf"(?<![a-z0-9]){re.escape(key.lower())}(?![a-z0-9])", lower):
+                text += " " + value
+        elif key.lower() in lower or key in query:
             text += " " + value
     return text
 
@@ -447,10 +564,36 @@ def expand_query(query: str) -> str:
 def extract_terms(text: str) -> set[str]:
     lower = text.lower()
     english = re.findall(r"[a-zA-Z][a-zA-Z0-9_\-]{1,}", lower)
-    chinese = re.findall(r"[\u4e00-\u9fff]{2,}", text)
+    chinese_sequences = re.findall(r"[\u4e00-\u9fff]{2,}", text)
+    chinese: list[str] = []
+    for sequence in chinese_sequences:
+        # Chinese queries do not contain whitespace, so keeping only the full
+        # sequence turns an entire question into one impossible keyword. Short
+        # n-grams retain domain phrases such as “自然语言处理” and “命名实体”.
+        upper = min(6, len(sequence))
+        for width in range(2, upper + 1):
+            chinese.extend(
+                sequence[index : index + width]
+                for index in range(len(sequence) - width + 1)
+            )
     short = re.findall(r"[A-Z]{2,}", text)
     terms = set(english + chinese + [s.lower() for s in short])
-    stop = {"什么", "怎么", "如何", "一下", "这个", "那个", "项目", "系统", "可以", "需要"}
+    stop = {
+        "什么",
+        "怎么",
+        "如何",
+        "一下",
+        "这个",
+        "那个",
+        "项目",
+        "系统",
+        "可以",
+        "需要",
+        "资料",
+        "根据",
+        "总结",
+        "重点",
+    }
     return {t for t in terms if t not in stop}
 
 
@@ -468,15 +611,6 @@ def title_overlap(query_terms: set[str], title: str) -> float:
     lower = title.lower()
     matched = sum(1 for term in query_terms if term in lower or term in title)
     return min(1.0, matched / 3)
-
-
-def rerank_hits(query: str, hits: list[SearchHit]) -> list[SearchHit]:
-    query_terms = extract_terms(expand_query(query))
-    for hit in hits:
-        dense_bonus = min(0.08, len(query_terms & extract_terms(hit.chunk.text)) * 0.015)
-        structure_bonus = 0.04 if any(k in hit.chunk.section.lower() for k in ["agent", "rag", "评估", "架构"]) else 0.0
-        hit.score = float(hit.score + dense_bonus + structure_bonus)
-    return sorted(hits, key=lambda h: h.score, reverse=True)
 
 
 def compact_text(text: str, limit: int = 220) -> str:

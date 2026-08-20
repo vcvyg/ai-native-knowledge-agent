@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import re
 import threading
@@ -10,6 +11,7 @@ from typing import Any
 
 import requests
 
+from .context_engine import ContextBundle
 from .embeddings import EmbeddingProvider
 from .engineering_tools import (
     evidence_summary_tool,
@@ -27,8 +29,10 @@ from .engineering_tools import (
     synthesize_validation_plan,
     validation_plan_tool,
 )
+from .memory import AgentMemory
 from .rag_engine import KnowledgeBase, SearchHit, compact_text
-from .workflow import END, AgentState, GraphEvent, GraphRun, StateGraph
+from .skills import SkillRegistry, ToolDefinition, ToolRegistry
+from .workflow import END, AgentState, EventSink, GraphEvent, GraphRun, StateGraph
 
 
 @dataclass
@@ -69,30 +73,6 @@ class DebugCheckpoint:
     breakpoints: set[str]
     state: AgentState
     run: GraphRun
-
-
-class SessionMemory:
-    def __init__(self) -> None:
-        self._sessions: dict[str, list[dict[str, str]]] = {}
-
-    def ensure(self, session_id: str | None) -> str:
-        sid = session_id or str(uuid.uuid4())
-        self._sessions.setdefault(sid, [])
-        return sid
-
-    def add(self, session_id: str, role: str, content: str) -> None:
-        history = self._sessions.setdefault(session_id, [])
-        history.append({"role": role, "content": content})
-        del history[:-8]
-
-    def recent(self, session_id: str, limit: int = 4) -> list[dict[str, str]]:
-        return self._sessions.get(session_id, [])[-limit:]
-
-    def last_user_topic(self, session_id: str) -> str:
-        for item in reversed(self._sessions.get(session_id, [])):
-            if item["role"] == "user":
-                return item["content"]
-        return ""
 
 
 def bounded_int_env(name: str, default: int, minimum: int, maximum: int) -> int:
@@ -321,12 +301,24 @@ class OptionalLLMClient:
 class KnowledgeAgent:
     def __init__(self, kb: KnowledgeBase) -> None:
         self.kb = kb
-        self.memory = SessionMemory()
+        self.memory = AgentMemory()
         self.router = CapabilityRouter(kb.embedding_provider)
         self.llm = OptionalLLMClient()
+        self.skills = SkillRegistry()
+        self.tool_registry = self._build_tool_registry()
+        self.mcp_tools_by_intent: dict[str, list[str]] = {}
+        self.mcp_config_error: str | None = None
+        self._register_configured_mcp_tools()
         self.max_retrieval_attempts = bounded_int_env(
             "AI_AGENT_MAX_RETRIEVAL_ATTEMPTS", default=2, minimum=1, maximum=3
         )
+        self.max_react_steps = bounded_int_env(
+            "AI_AGENT_MAX_REACT_STEPS", default=3, minimum=1, maximum=5
+        )
+        self.context_token_budget = bounded_int_env(
+            "AI_AGENT_CONTEXT_TOKEN_BUDGET", default=1800, minimum=256, maximum=8000
+        )
+        self._seed_long_term_memory()
         self.workflow = self._build_workflow()
         self._debug_runs: dict[str, DebugCheckpoint] = {}
         self._debug_lock = threading.Lock()
@@ -336,14 +328,19 @@ class KnowledgeAgent:
             "entrypoint": "route",
             "nodes": [
                 "route",
+                "recall_memory",
+                "plan",
                 "retrieve",
                 "verify_evidence",
                 "rewrite_query",
-                "execute_tools",
+                "react",
+                "reflect",
                 "synthesize",
             ],
             "edges": [
-                {"from": "route", "to": "retrieve", "when": "retrieval tool selected"},
+                {"from": "route", "to": "recall_memory", "when": "always"},
+                {"from": "recall_memory", "to": "plan", "when": "always"},
+                {"from": "plan", "to": "retrieve", "when": "retrieval tool selected"},
                 {"from": "retrieve", "to": "verify_evidence", "when": "always"},
                 {
                     "from": "verify_evidence",
@@ -353,19 +350,30 @@ class KnowledgeAgent:
                 {"from": "rewrite_query", "to": "retrieve", "when": "retry"},
                 {
                     "from": "verify_evidence",
-                    "to": "execute_tools",
+                    "to": "react",
                     "when": "evidence sufficient or retry limit reached",
                 },
-                {"from": "execute_tools", "to": "synthesize", "when": "always"},
+                {"from": "react", "to": "reflect", "when": "tool observation available"},
+                {"from": "reflect", "to": "react", "when": "plan has another action"},
+                {"from": "reflect", "to": "synthesize", "when": "accepted or bounded stop"},
             ],
             "max_retrieval_attempts": self.max_retrieval_attempts,
+            "max_react_steps": self.max_react_steps,
+            "context_token_budget": self.context_token_budget,
         }
 
-    def ask(self, query: str, session_id: str | None = None, top_k: int = 6) -> AgentResponse:
+    def ask(
+        self,
+        query: str,
+        session_id: str | None = None,
+        top_k: int = 6,
+        *,
+        event_sink: EventSink | None = None,
+    ) -> AgentResponse:
         started = time.perf_counter()
         sid = self.memory.ensure(session_id)
         state = self._new_state(query, sid, top_k)
-        graph_run = self.workflow.run(state)
+        graph_run = self.workflow.run(state, event_sink=event_sink)
         return self._build_response(sid, state, graph_run, started, record_memory=True)
 
     def debug_start(
@@ -457,6 +465,7 @@ class KnowledgeAgent:
             retrieval_query=normalized_query,
             top_k=top_k,
             trace=[],
+            session_id=session_id,
         )
 
     def _validate_breakpoints(self, breakpoints: list[str]) -> set[str]:
@@ -524,6 +533,22 @@ class KnowledgeAgent:
         if record_memory:
             self.memory.add(sid, "user", state.query)
             self.memory.add(sid, "assistant", state.answer)
+            self.memory.remember_episode(
+                query=state.query,
+                answer=state.answer,
+                intent=state.intent,
+                stop_reason=state.stop_reason,
+                sources=[str(item["source"]) for item in citations],
+                success=state.evidence_quality in {"ok", "not_required"},
+            )
+            self.memory.update_working(
+                sid,
+                current_task=state.query,
+                intent=state.intent,
+                graph_path=graph_run.path,
+                last_observation=state.observations[-1] if state.observations else None,
+                stop_reason=state.stop_reason,
+            )
         kb_stats = self.kb.stats()
         metrics = {
             "latency_ms": int((time.perf_counter() - started) * 1000),
@@ -543,6 +568,14 @@ class KnowledgeAgent:
             "reranker_degraded": kb_stats["reranker_degraded"],
             "reranker_fallback_count": kb_stats["reranker_fallback_count"],
             "retrieval_attempts": state.retrieval_attempts,
+            "selected_skill": state.selected_skill,
+            "plan": state.plan,
+            "react_steps": state.react_steps,
+            "reflection": state.reflection,
+            "memory_recall": state.memory_hits,
+            "memory_stats": self.memory.stats(),
+            "context": state.context_metrics,
+            "mcp_config_error": self.mcp_config_error,
             "stop_reason": "breakpoint" if graph_run.status == "paused" else state.stop_reason,
             "graph_path": graph_run.path,
             "workflow_steps": graph_run.transitions,
@@ -563,15 +596,20 @@ class KnowledgeAgent:
     def _build_workflow(self) -> StateGraph:
         graph = StateGraph()
         graph.add_node("route", self._route_node)
+        graph.add_node("recall_memory", self._recall_memory_node)
+        graph.add_node("plan", self._plan_node)
         graph.add_node("retrieve", self._retrieve_node)
         graph.add_node("verify_evidence", self._verify_evidence_node)
         graph.add_node("rewrite_query", self._rewrite_query_node)
-        graph.add_node("execute_tools", self._execute_tools_node)
+        graph.add_node("react", self._react_node)
+        graph.add_node("reflect", self._reflect_node)
         graph.add_node("synthesize", self._synthesize_node)
         graph.set_entrypoint("route")
+        graph.add_edge("route", "recall_memory")
+        graph.add_edge("recall_memory", "plan")
         graph.add_edge(
-            "route",
-            lambda state: "retrieve" if "hybrid_retrieval" in state.tools else "execute_tools",
+            "plan",
+            lambda state: "retrieve" if "hybrid_retrieval" in state.tools else "react",
         )
         graph.add_edge("retrieve", "verify_evidence")
         graph.add_edge(
@@ -579,10 +617,17 @@ class KnowledgeAgent:
             lambda state: "rewrite_query"
             if state.evidence_quality == "low"
             and state.retrieval_attempts < self.max_retrieval_attempts
-            else "execute_tools",
+            else "react",
         )
         graph.add_edge("rewrite_query", "retrieve")
-        graph.add_edge("execute_tools", "synthesize")
+        graph.add_edge("react", "reflect")
+        graph.add_edge(
+            "reflect",
+            lambda state: "react"
+            if state.reflection.get("decision") == "continue"
+            and state.react_steps < self.max_react_steps
+            else "synthesize",
+        )
         graph.add_edge("synthesize", END)
         return graph
 
@@ -593,23 +638,82 @@ class KnowledgeAgent:
             {"query": state.query},
             lambda: self._route(state.normalized_query),
         )
+        state.tools.extend(self.mcp_tools_by_intent.get(state.intent, []))
+
+    def _recall_memory_node(self, state: AgentState) -> None:
+        recalled = self.memory.recall(
+            state.normalized_query,
+            task_type=state.intent,
+            limit=4,
+        )
+        state.memory_hits = [hit.to_dict() for hit in recalled]
+        state.trace.append(
+            ToolCall(
+                name="memory_recall",
+                input={"query": state.normalized_query, "task_type": state.intent},
+                output={
+                    "hits": len(recalled),
+                    "partitions": [hit.record.partition for hit in recalled],
+                    "scores": [round(hit.score, 4) for hit in recalled],
+                },
+                latency_ms=0,
+            )
+        )
+
+    def _plan_node(self, state: AgentState) -> None:
+        skill = self.skills.select(state.intent)
+        state.selected_skill = skill.name
+        configured_mcp = self.mcp_tools_by_intent.get(state.intent, [])
+        actions = [tool for tool in skill.allowed_tools if tool in state.tools]
+        actions.extend(tool for tool in configured_mcp if tool not in actions)
+        if not actions:
+            actions = [
+                tool
+                for tool in state.tools
+                if tool not in {"hybrid_retrieval", "rerank", "answer_synthesizer"}
+            ]
+        state.plan = {
+            "objective": state.normalized_query,
+            "skill": skill.name,
+            "actions": actions[: self.max_react_steps],
+            "allowed_tools": list(skill.allowed_tools),
+            "retrieval_budget": self.max_retrieval_attempts,
+            "react_budget": self.max_react_steps,
+        }
+        state.trace.append(
+            ToolCall(
+                name="planner",
+                input={"intent": state.intent, "memory_hits": len(state.memory_hits)},
+                output=state.plan,
+                latency_ms=0,
+            )
+        )
 
     def _retrieve_node(self, state: AgentState) -> None:
         state.retrieval_attempts += 1
-        current_hits = timed_call(
+        bundle = timed_call(
             state.trace,
             "hybrid_retrieval",
             {
                 "query": state.retrieval_query,
                 "top_k": state.top_k,
                 "attempt": state.retrieval_attempts,
+                "token_budget": self.context_token_budget,
             },
-            lambda: self.kb.search(state.retrieval_query, top_k=state.top_k),
+            lambda: self.kb.build_context(
+                state.retrieval_query,
+                top_k=state.top_k,
+                token_budget=self.context_token_budget,
+            ),
         )
+        current_hits = bundle.hits
         if current_hits and (
             not state.best_hits or current_hits[0].score > state.best_hits[0].score
         ):
             state.best_hits = current_hits
+            state.context_metrics = bundle.to_dict()
+        elif not state.context_metrics:
+            state.context_metrics = bundle.to_dict()
         state.hits = state.best_hits or current_hits
 
         if "rerank" in state.tools:
@@ -648,7 +752,7 @@ class KnowledgeAgent:
                     "top_score": round(state.hits[0].score, 4) if state.hits else 0.0,
                     "next": "rewrite_query"
                     if weak and state.retrieval_attempts < self.max_retrieval_attempts
-                    else "execute_tools",
+                    else "react",
                 },
                 latency_ms=0,
             )
@@ -670,36 +774,79 @@ class KnowledgeAgent:
             )
         )
 
-    def _execute_tools_node(self, state: AgentState) -> None:
+    def _react_node(self, state: AgentState) -> None:
         if "hybrid_retrieval" not in state.tools:
             state.evidence_quality = "not_required"
             state.stop_reason = "tool_only_workflow"
-        tool_map = {
-            "agent_planner": lambda: agent_plan(state.intent, state.tools),
-            "compare_tool": lambda: compare_tool(state.normalized_query, state.hits),
-            "evaluation_tool": evaluation_tool,
-            "evidence_summary": lambda: evidence_summary_tool(state.normalized_query, state.hits),
-            "explain_component": lambda: explain_component_tool(state.normalized_query, state.hits),
-            "impact_analysis": lambda: impact_analysis_tool(state.normalized_query, state.hits),
-            "incident_triage": lambda: incident_triage_tool(state.normalized_query, state.hits),
-            "pr_review": lambda: pr_review_tool(state.normalized_query, state.hits),
-            "validation_plan": lambda: validation_plan_tool(state.normalized_query, state.hits),
-            "runbook": lambda: runbook_tool(state.normalized_query, state.hits),
+        actions = list(state.plan.get("actions", []))
+        if state.react_steps >= len(actions) or state.react_steps >= self.max_react_steps:
+            return
+        tool_name = actions[state.react_steps]
+        state.react_steps += 1
+        execution = self.tool_registry.execute(
+            tool_name,
+            {
+                "query": state.normalized_query,
+                "hits": state.hits,
+                "intent": state.intent,
+                "tools": state.tools,
+            },
+            idempotency_key=(
+                f"{state.session_id}:{state.query}:{state.retrieval_query}:"
+                f"{tool_name}:{','.join(hit.chunk.id for hit in state.hits)}"
+            ),
+        )
+        observation = {
+            "tool": tool_name,
+            "source": execution.source,
+            "status": execution.status,
+            "output": summarize_tool_output(execution.output),
+            "idempotent_replay": execution.idempotent_replay,
+            "approval_token": execution.approval_token,
         }
-        for tool_name in state.tools:
-            tool = tool_map.get(tool_name)
-            if tool is None:
-                continue
-            timed_call(
-                state.trace,
-                tool_name,
-                {
+        state.observations.append(observation)
+        state.trace.append(
+            ToolCall(
+                name=tool_name,
+                input={
                     "intent": state.intent,
                     "query": state.normalized_query,
                     "evidence": len(state.hits),
+                    "skill": state.selected_skill,
                 },
-                tool,
+                output=observation,
+                latency_ms=execution.latency_ms,
             )
+        )
+
+    def _reflect_node(self, state: AgentState) -> None:
+        actions = list(state.plan.get("actions", []))
+        failed = any(item["status"] == "failed" for item in state.observations)
+        waiting = any(item["status"] == "waiting_approval" for item in state.observations)
+        if failed:
+            decision, reason = "stop", "tool_failure"
+            state.stop_reason = "tool_failure"
+        elif waiting:
+            decision, reason = "stop", "human_approval_required"
+            state.stop_reason = "human_approval_required"
+        elif state.react_steps < len(actions) and state.react_steps < self.max_react_steps:
+            decision, reason = "continue", "planned_action_remaining"
+        else:
+            decision, reason = "accept", "evidence_and_tool_observation_ready"
+        state.reflection = {
+            "decision": decision,
+            "reason": reason,
+            "observations": len(state.observations),
+            "remaining_actions": max(0, len(actions) - state.react_steps),
+        }
+        state.trace.append(
+            ToolCall(
+                name="reflection",
+                input={"plan": state.plan, "evidence_quality": state.evidence_quality},
+                output=state.reflection,
+                latency_ms=0,
+            )
+        )
 
     def _synthesize_node(self, state: AgentState) -> None:
         state.answer = timed_call(
@@ -713,7 +860,12 @@ class KnowledgeAgent:
                 "llm_enabled": self.llm.enabled,
                 "vector_backend": self.kb.stats()["vector_backend"],
             },
-            lambda: self._synthesize(state.normalized_query, state.intent, state.hits),
+            lambda: self._synthesize(
+                state.normalized_query,
+                state.intent,
+                state.hits,
+                state.memory_hits,
+            ),
         )
 
     def _route(self, query: str) -> tuple[str, list[str], float]:
@@ -729,7 +881,13 @@ class KnowledgeAgent:
                 return f"{topic}\n追问：{query}"
         return query
 
-    def _synthesize(self, query: str, intent: str, hits: list[SearchHit]) -> str:
+    def _synthesize(
+        self,
+        query: str,
+        intent: str,
+        hits: list[SearchHit],
+        memory_hits: list[dict[str, Any]] | None = None,
+    ) -> str:
         concept_card = detect_concept_card(query)
         if concept_card and intent == "repository_qa":
             return synthesize_concept_card(query, concept_card, hits)
@@ -748,6 +906,11 @@ class KnowledgeAgent:
                 f"[{idx + 1}] {hit.chunk.title} / {hit.chunk.section}: {hit.chunk.text}"
                 for idx, hit in enumerate(hits[:5])
             )
+            if memory_hits:
+                context += "\n\n历史经验（仅作辅助，不替代直接证据）：\n" + "\n".join(
+                    f"- {item['partition']}: {compact_text(str(item['content']), 180)}"
+                    for item in memory_hits[:3]
+                )
             llm_answer = self.llm.chat(query, context)
             if llm_answer:
                 return llm_answer
@@ -773,6 +936,112 @@ class KnowledgeAgent:
         if intent == "repository_qa":
             return synthesize_explain_component(query, hits)
         return synthesize_rag_answer(query, hits)
+
+    def _build_tool_registry(self) -> ToolRegistry:
+        registry = ToolRegistry()
+        handlers = {
+            "evidence_summary": lambda payload: evidence_summary_tool(
+                str(payload["query"]), list(payload["hits"])
+            ),
+            "explain_component": lambda payload: explain_component_tool(
+                str(payload["query"]), list(payload["hits"])
+            ),
+            "impact_analysis": lambda payload: impact_analysis_tool(
+                str(payload["query"]), list(payload["hits"])
+            ),
+            "incident_triage": lambda payload: incident_triage_tool(
+                str(payload["query"]), list(payload["hits"])
+            ),
+            "pr_review": lambda payload: pr_review_tool(
+                str(payload["query"]), list(payload["hits"])
+            ),
+            "validation_plan": lambda payload: validation_plan_tool(
+                str(payload["query"]), list(payload["hits"])
+            ),
+            "runbook": lambda payload: runbook_tool(
+                str(payload["query"]), list(payload["hits"])
+            ),
+            "compare_tool": lambda payload: compare_tool(
+                str(payload["query"]), list(payload["hits"])
+            ),
+            "evaluation_tool": lambda _payload: evaluation_tool(),
+            "agent_planner": lambda payload: agent_plan(
+                str(payload.get("intent", "agent_design")),
+                list(payload.get("tools", [])),
+            ),
+        }
+        for name, handler in handlers.items():
+            registry.register_native(
+                ToolDefinition(
+                    name=name,
+                    source="native",
+                    description=f"Native engineering tool: {name}",
+                    input_schema={"type": "object"},
+                    risk="read",
+                ),
+                handler,
+            )
+        return registry
+
+    def _seed_long_term_memory(self) -> None:
+        for skill in self.skills.list():
+            self.memory.remember(
+                "procedural",
+                f"{skill['name']}: {skill['instructions']}",
+                source="skill_registry",
+                task_type=str(skill["intent"]),
+                importance=0.75,
+                external_id=str(skill["name"]),
+                metadata={"allowed_tools": skill["allowed_tools"]},
+            )
+        seen_docs: set[str] = set()
+        for chunk in self.kb.chunks:
+            if chunk.doc_id in seen_docs:
+                continue
+            seen_docs.add(chunk.doc_id)
+            self.memory.remember(
+                "semantic",
+                f"{chunk.title} / {chunk.section}: {compact_text(chunk.text, 260)}",
+                source=chunk.source,
+                importance=0.55,
+                external_id=chunk.doc_id,
+            )
+
+    def _register_configured_mcp_tools(self) -> None:
+        """Register MCP tools from JSON without storing credentials in the project."""
+
+        raw = os.getenv("AI_AGENT_MCP_TOOLS_JSON", "").strip()
+        if not raw:
+            return
+        try:
+            items = json.loads(raw)
+            if not isinstance(items, list):
+                raise ValueError("configuration must be a JSON array")
+            for item in items:
+                if not isinstance(item, dict):
+                    raise ValueError("each MCP tool configuration must be an object")
+                name = str(item["name"])
+                endpoint = str(item["endpoint"])
+                if not endpoint.startswith(("http://", "https://")):
+                    raise ValueError(f"MCP endpoint must use http(s): {name}")
+                risk = str(item.get("risk", "read"))
+                if risk not in {"read", "write", "destructive"}:
+                    raise ValueError(f"invalid MCP risk for {name}: {risk}")
+                self.tool_registry.register_mcp(
+                    ToolDefinition(
+                        name=name,
+                        source="mcp",
+                        description=str(item.get("description", f"MCP tool: {name}")),
+                        input_schema=dict(item.get("input_schema", {"type": "object"})),
+                        risk=risk,  # type: ignore[arg-type]
+                        remote_name=str(item.get("remote_name", name)),
+                    ),
+                    endpoint=endpoint,
+                )
+                for intent in item.get("intents", []):
+                    self.mcp_tools_by_intent.setdefault(str(intent), []).append(name)
+        except Exception as exc:
+            self.mcp_config_error = f"{type(exc).__name__}: {exc}"
 
 
 def timed_call(trace: list[ToolCall], name: str, input_payload: dict[str, Any], fn):
@@ -802,6 +1071,11 @@ def serialize_graph_event(event: GraphEvent) -> dict[str, Any]:
 
 
 def summarize_tool_output(result: Any) -> dict[str, Any]:
+    if isinstance(result, ContextBundle):
+        return {
+            "hits": len(result.hits),
+            **result.to_dict(),
+        }
     if isinstance(result, tuple):
         return {"result": list(result)}
     if isinstance(result, list):
@@ -1000,8 +1274,13 @@ def synthesize_compare(query: str, hits: list[SearchHit]) -> str:
 
 def synthesize_agent_design(query: str, hits: list[SearchHit]) -> str:
     return (
-        "这个 Agent 的执行链路是：Route -> Retrieve/Rerank -> Verify Evidence -> 必要时 Rewrite Query 并有界重试 -> Execute Tools -> Synthesize。\n"
-        "State Graph 显式保存意图、最佳证据、重试次数和停止原因；Tool Use 负责检索与工程分析，Session Memory 负责追问补全，Graph Path 与 Trace 用于观测和回归验证。"
+        "RepoPilot 的外层链路是：Route -> Recall Memory -> Plan/Select Skill -> "
+        "Hybrid Retrieve/Rerank -> Evidence Graph/Context Pack -> Verify Evidence -> "
+        "ReAct -> Reflection -> Synthesize。证据不足时进入有预算的 Query Rewrite。\n"
+        "内层 ReAct 按 Action -> Native/MCP Tool -> Observation -> Reflection 决定继续或停止；"
+        "Working/Episodic/Semantic/Procedural Memory 分别保存当前状态、历史轨迹、仓库知识与工程步骤。"
+        "State Graph 同时约束检索、工具步数和全局转换，Graph Path、Context Budget、Memory Recall、"
+        "Tool Trace 与 Stop Reason 都能用于调试、评测和 post-training。"
     )
 
 
@@ -1022,9 +1301,12 @@ def agent_plan(intent: str, tools: list[str]) -> dict[str, Any]:
         "steps": [
             "normalize_query",
             "route_intent",
+            "recall_partitioned_memory",
+            "select_skill",
             *[tool for tool in tools if tool != "answer_synthesizer"],
+            "reflect_on_observation",
             "grounded_answer",
-            "update_session_memory",
+            "write_episodic_memory",
         ],
     }
 

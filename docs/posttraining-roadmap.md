@@ -7,16 +7,17 @@
 ## 已落地的无 GPU 前置层
 
 - 每次运行已有显式 Graph Event、Tool Call、证据、答案和 Stop Reason。
-- `trajectory_learning.py` 把运行转换成版本化轨迹记录。
+- `trajectory_learning.py` 把运行转换成 schema v2 轨迹，包含 Skill、Plan、Policy Step、Observation、Reflection、Context 与 Memory Recall。
 - 奖励由意图、来源命中、工具选择、证据门控和有界停止组成，并处罚无证据完成、误拒绝、静默降级和转换溢出。
 - 工具结果和检索证据作为环境观察保留在上下文，但默认不进入策略损失；训练目标只覆盖助手回答和助手工具选择。
-- `python -m scripts.export_posttraining` 可用真实 BGE 对标注评测集回放并生成 JSONL。
+- `python -m scripts.export_posttraining` 可用真实 BGE 回放标注集，并分别生成 trajectory、SFT tool-policy 和 preference JSONL。
+- Preference exporter 只配对同一 prompt 下 reward 不同的真实轨迹；当前单轨迹基线可能输出 0 对，这是数据缺口，不会用伪造失败回答凑数。
 
 ## 建议训练顺序
 
 1. **数据与奖励验证**：先扩充工程任务和失败样例，人工复核奖励是否与真实质量一致。
 2. **SFT**：用高质量成功轨迹学习输出结构、工具协议和停止格式。
-3. **偏好优化**：构造“有证据/无证据”“正确回退/强行回答”等成对轨迹，训练边界偏好。
+3. **偏好优化**：对同一任务采样“有证据/无证据”“正确回退/强行回答”等多条真实轨迹，再按规则奖励构造成对数据。
 4. **GSPO/GRPO Agentic RL**：对同一任务采样多条轨迹，用可验证规则奖励工具选择、测试结果和最终结论。
 5. **上线门控**：只有离线 Source Hit、Evidence Gate、Tool Accuracy 和真实 Bad Case 均优于基线才进入小流量。
 

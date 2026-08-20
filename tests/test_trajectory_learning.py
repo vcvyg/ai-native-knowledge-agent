@@ -1,7 +1,13 @@
 from __future__ import annotations
 
 from app.agent import AgentResponse, ToolCall
-from app.trajectory_learning import TrajectoryOracle, build_training_record, score_response
+from app.trajectory_learning import (
+    TrajectoryOracle,
+    build_preference_pairs,
+    build_sft_example,
+    build_training_record,
+    score_response,
+)
 
 
 def response(*, low: bool = False, stop_reason: str = "evidence_sufficient") -> AgentResponse:
@@ -22,6 +28,9 @@ def response(*, low: bool = False, stop_reason: str = "evidence_sufficient") -> 
             "graph_events": [],
             "reranker_degraded": False,
             "reranker_error": None,
+            "retrieval_attempts": 1,
+            "react_steps": 1,
+            "reflection": {"decision": "accept"},
         },
     )
 
@@ -61,3 +70,22 @@ def test_training_record_keeps_tools_and_masks_observations() -> None:
     assert record["trajectory"]["tool_calls"][1]["name"] == "impact_analysis"
     assert "tool_results" in record["loss_mask_policy"]["mask"]
     assert record["reward"]["total"] == 1.0
+
+    sft = build_sft_example(record)
+    assert sft["messages"][-1]["tool_policy"]
+    assert sft["loss_mask"]["mask"] == record["loss_mask_policy"]["mask"]
+
+
+def test_preference_pairs_require_same_prompt_and_distinct_reward() -> None:
+    oracle = TrajectoryOracle(expected_intent="change_impact")
+    chosen = build_training_record("same task", response(), oracle)
+    rejected = build_training_record(
+        "same task",
+        response(low=True, stop_reason="retrieval_retry_limit"),
+        oracle,
+    )
+
+    pairs = build_preference_pairs([rejected, chosen])
+
+    assert len(pairs) == 1
+    assert pairs[0]["chosen_reward"] > pairs[0]["rejected_reward"]

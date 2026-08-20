@@ -1,4 +1,4 @@
-# Engineering Change Agent 评估方案
+# RepoPilot 评估方案
 
 ## 评估目标
 
@@ -14,12 +14,14 @@
 | PR 审查 | 检查兼容性与测试缺口 | pr_review | 错误处理、幂等、回归 |
 | 验证计划 | 验证低证据重试与回滚 | validation_plan | baseline、oracle、故障注入 |
 | 域外问题 | 生产结算重复扣款根因 | evidence guard | 有界重试并拒绝编造 |
+| Memory/Skill/ReAct | 解释分层记忆和反思链路 | agent_planner + reflection | 来源、Skill、Plan、反思 |
 
 ## 指标
 
 - 检索：Source Hit Rate、Top-K 命中、MRR、Rerank 分数。
 - 证据：Evidence Gate Accuracy、Citation Coverage、Groundedness、低证据拦截率。
-- Agent：Intent Accuracy、Tool Accuracy、平均检索次数、Stop Reason、Graph Path。
+- Agent：Intent Accuracy、Tool Accuracy、平均检索次数、Skill、ReAct Steps、Reflection、Stop Reason、Graph Path。
+- Context/Memory：Token Budget、Source Diversity、Evidence Relation、Memory Partition 与召回分数。
 - 工程：p50/p95 Latency、API 成功率、索引构建时间、失败恢复覆盖。
 
 运行：
@@ -29,7 +31,7 @@ python -m pytest
 python -m scripts.evaluate
 ```
 
-自动评测结果由 `scripts.evaluate` 写入 `reports/evaluation-results.json`。当前 6 条用例只是一组可复现回归基线，不能解释为生产准确率；真实结果以该 JSON 文件的最新时间戳与模型元数据为准。
+自动评测结果由 `scripts.evaluate` 写入 `reports/evaluation-results.json`。当前 7 条用例只是一组可复现回归基线，不能解释为生产准确率；真实结果以该 JSON 文件的最新时间戳与模型元数据为准。
 
 ## 扩展计划
 

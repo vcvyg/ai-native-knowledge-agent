@@ -8,17 +8,39 @@
 
 ```mermaid
 flowchart TD
-    A["Route"] --> B["Retrieve"]
-    B --> C["Rerank"]
-    C --> D["Verify Evidence"]
-    D -->|"low evidence + retry budget"| E["Rewrite Query"]
-    E --> B
-    D -->|"sufficient or retry limit"| F["Execute Intent Tools"]
-    F --> G["Synthesize"]
-    G --> H["Answer + Citations + Metrics"]
+    A["Route"] --> B["Recall Memory"]
+    B --> C["Plan + Select Skill"]
+    C --> D["Hybrid Retrieve"]
+    D --> E["Rerank + Evidence Graph + Context Pack"]
+    E --> F["Verify Evidence"]
+    F -->|"low evidence + retry budget"| G["Rewrite Query"]
+    G --> D
+    F -->|"sufficient or retry limit"| H["ReAct Action / Tool Registry"]
+    H --> I["Observation"]
+    I --> J["Reflection"]
+    J -->|"planned action remains"| H
+    J --> K["Synthesize"]
+    K --> L["Answer + Citations + Episodic Memory"]
 ```
 
-`AgentState` 在节点之间传递：原始问题、当前检索查询、意图、工具列表、最佳证据、尝试次数、证据质量、答案和停止原因。`StateGraph` 另外设置全局 transition limit，防止错误路由造成无界循环。
+`AgentState` 在节点之间传递原始问题、当前检索查询、意图、Skill、Plan、Memory hits、packed context、Tool Observation、Reflection、尝试次数、证据质量、答案和停止原因。`StateGraph` 同时限制 retrieval、ReAct step 和全局 transition，防止错误路由造成无界循环。
+
+## Context Engine
+
+Document ID 由稳定文件身份生成，Chunk ID 由 `doc_id + section + normalized content` 生成，因此在前面插入无关章节不会让所有 chunk identity 漂移。重新加载时按内容身份复用未变化向量；删除文档时先移动到 `.trash` tombstone 并重建增量索引，API 支持恢复。
+
+检索链为 `Dense + exact terms → rerank → bounded link expansion → context pack`。Evidence Graph 当前解析 `[[WikiLink]]` 关系；Context Packer 按来源优先级、去重、单来源上限和 mixed-language token 估算，在 `AI_AGENT_CONTEXT_TOKEN_BUDGET` 内选择上下文，并暴露 dropped chunks、source count 与 relation。
+
+## Memory and Skill Execution
+
+- Working Memory：当前任务、Graph Path、最后 Observation 与 Stop Reason。
+- Episodic Memory：已完成/失败运行、来源与停止原因。
+- Semantic Memory：知识文档的稳定摘要；直接结论仍必须由本次 KB evidence 支撑。
+- Procedural Memory：Skill instructions、allowed tools 和 evaluation oracle。
+
+长期记忆召回分数由 relevance、recency、task match、importance 组成，响应暴露每个分量。Skill 选择后，ReAct 按计划逐个调用 Tool Registry；Reflection 根据剩余动作、失败和审批状态决定 continue / accept / stop。
+
+Tool Registry 对 Native 与 MCP 使用同一执行协议。MCP 客户端执行 Streamable HTTP initialize、initialized notification 与 `tools/call`。写/破坏性工具必须审批；相同 idempotency key 复用第一次完成结果，可回滚工具登记补偿回调。
 
 ## Breakpoint and Checkpoint
 
@@ -26,9 +48,11 @@ flowchart TD
 
 - Resume：保留当前状态继续，循环再次经过同一节点时仍会命中断点。
 - Edit and Restart：替换问题并从 Route 重新计算，避免把旧意图或旧证据带入新问题。
-- Cancel：清理 Checkpoint，不写入 Session Memory。
+- Cancel：清理 Checkpoint，不写入 Episodic Memory。
 
 前端 SVG 执行图根据 `graph_events` 区分 completed、warning、retry、failed 和 paused，并将工具事件按实际顺序展开。
+
+普通 `/api/ask` 返回完整结果；`/api/ask/stream` 在后台线程运行同一 State Graph，并通过 SSE event sink 在每个节点完成、失败或暂停时立即推送 `graph_event`，最后推送 `final`。这里选择 SSE 是因为运行状态是服务端到客户端的单向事件流；不会为了复用 WebSocket 关键词引入不必要的双向协议。
 
 ## Verification Loop
 
@@ -60,6 +84,9 @@ flowchart TD
 - `citations`：来源、章节、片段和各检索分数。
 - `graph_events`：节点顺序、状态、耗时、下一节点和当时的证据/重试状态。
 - `embedding_model`：实际使用的模型与向量维度。
+- `selected_skill / plan / react_steps / reflection`：动态决策与停止依据。
+- `memory_recall`：分区、综合分及 relevance/recency/task-match 明细。
+- `context`：token budget、实际估算、丢弃片段、来源数和证据关系。
 
 ## Evaluation
 

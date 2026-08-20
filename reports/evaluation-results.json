@@ -1,15 +1,15 @@
 {
   "summary": {
-    "cases": 6,
-    "passed": 6,
+    "cases": 7,
+    "passed": 7,
     "pass_rate": 1.0,
     "intent_accuracy": 1.0,
     "source_hit_rate": 1.0,
     "tool_accuracy": 1.0,
     "evidence_gate_accuracy": 1.0,
-    "average_latency_ms": 40.17,
-    "p95_latency_ms": 49,
-    "average_retrieval_attempts": 1.17
+    "average_latency_ms": 42,
+    "p95_latency_ms": 71,
+    "average_retrieval_attempts": 1.14
   },
   "cases": [
     {
@@ -20,20 +20,24 @@
       "source_ok": true,
       "tools_ok": true,
       "evidence_ok": true,
-      "latency_ms": 49,
+      "latency_ms": 71,
       "retrieval_attempts": 1,
       "stop_reason": "evidence_sufficient",
       "trace": [
         "intent_router",
+        "memory_recall",
+        "planner",
         "hybrid_retrieval",
         "rerank",
         "evidence_verifier",
         "agent_planner",
+        "reflection",
         "answer_synthesizer"
       ],
       "citations": [
         "00-system-architecture.md",
-        "02-incident-response-runbook.md"
+        "02-incident-response-runbook.md",
+        "03-pr-review-standard.md"
       ],
       "passed": true
     },
@@ -45,19 +49,23 @@
       "source_ok": true,
       "tools_ok": true,
       "evidence_ok": true,
-      "latency_ms": 38,
+      "latency_ms": 35,
       "retrieval_attempts": 1,
       "stop_reason": "evidence_sufficient",
       "trace": [
         "intent_router",
+        "memory_recall",
+        "planner",
         "hybrid_retrieval",
         "rerank",
         "evidence_verifier",
         "impact_analysis",
+        "reflection",
         "answer_synthesizer"
       ],
       "citations": [
         "01-change-impact-playbook.md",
+        "02-incident-response-runbook.md",
         "04-change-request-cross-encoder.md"
       ],
       "passed": true
@@ -70,19 +78,24 @@
       "source_ok": true,
       "tools_ok": true,
       "evidence_ok": true,
-      "latency_ms": 38,
+      "latency_ms": 44,
       "retrieval_attempts": 1,
       "stop_reason": "evidence_sufficient",
       "trace": [
         "intent_router",
+        "memory_recall",
+        "planner",
         "hybrid_retrieval",
         "rerank",
         "evidence_verifier",
         "incident_triage",
+        "reflection",
         "answer_synthesizer"
       ],
       "citations": [
-        "02-incident-response-runbook.md"
+        "01-change-impact-playbook.md",
+        "02-incident-response-runbook.md",
+        "03-pr-review-standard.md"
       ],
       "passed": true
     },
@@ -94,21 +107,23 @@
       "source_ok": true,
       "tools_ok": true,
       "evidence_ok": true,
-      "latency_ms": 42,
+      "latency_ms": 41,
       "retrieval_attempts": 1,
       "stop_reason": "evidence_sufficient",
       "trace": [
         "intent_router",
+        "memory_recall",
+        "planner",
         "hybrid_retrieval",
         "rerank",
         "evidence_verifier",
         "pr_review",
+        "reflection",
         "answer_synthesizer"
       ],
       "citations": [
         "01-change-impact-playbook.md",
-        "03-pr-review-standard.md",
-        "04-change-request-cross-encoder.md"
+        "03-pr-review-standard.md"
       ],
       "passed": true
     },
@@ -120,18 +135,22 @@
       "source_ok": true,
       "tools_ok": true,
       "evidence_ok": true,
-      "latency_ms": 33,
+      "latency_ms": 35,
       "retrieval_attempts": 1,
       "stop_reason": "evidence_sufficient",
       "trace": [
         "intent_router",
+        "memory_recall",
+        "planner",
         "hybrid_retrieval",
         "rerank",
         "evidence_verifier",
         "validation_plan",
+        "reflection",
         "answer_synthesizer"
       ],
       "citations": [
+        "01-change-impact-playbook.md",
         "02-incident-response-runbook.md",
         "03-pr-review-standard.md"
       ],
@@ -145,11 +164,13 @@
       "source_ok": true,
       "tools_ok": true,
       "evidence_ok": true,
-      "latency_ms": 41,
+      "latency_ms": 50,
       "retrieval_attempts": 2,
       "stop_reason": "retrieval_retry_limit",
       "trace": [
         "intent_router",
+        "memory_recall",
+        "planner",
         "hybrid_retrieval",
         "rerank",
         "evidence_verifier",
@@ -158,11 +179,42 @@
         "rerank",
         "evidence_verifier",
         "incident_triage",
+        "reflection",
         "answer_synthesizer"
       ],
       "citations": [
         "02-incident-response-runbook.md",
-        "03-pr-review-standard.md"
+        "03-pr-review-standard.md",
+        "04-change-request-cross-encoder.md"
+      ],
+      "passed": true
+    },
+    {
+      "id": "memory-skill-react",
+      "query": "解释 RepoPilot 的分层 Memory、Skill 与 ReAct 反思执行链路",
+      "intent": "agent_design",
+      "intent_ok": true,
+      "source_ok": true,
+      "tools_ok": true,
+      "evidence_ok": true,
+      "latency_ms": 18,
+      "retrieval_attempts": 1,
+      "stop_reason": "evidence_sufficient",
+      "trace": [
+        "intent_router",
+        "memory_recall",
+        "planner",
+        "hybrid_retrieval",
+        "rerank",
+        "evidence_verifier",
+        "agent_planner",
+        "reflection",
+        "answer_synthesizer"
+      ],
+      "citations": [
+        "00-system-architecture.md",
+        "01-change-impact-playbook.md",
+        "04-change-request-cross-encoder.md"
       ],
       "passed": true
     }

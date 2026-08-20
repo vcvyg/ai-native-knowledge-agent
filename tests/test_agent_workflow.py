@@ -77,7 +77,12 @@ def test_debug_run_pauses_edits_and_restarts(tmp_path: Path, monkeypatch) -> Non
 
     assert paused.status == "paused"
     assert paused.next_node == "verify_evidence"
-    assert paused.response.metrics["graph_path"] == ["route", "retrieve"]
+    assert paused.response.metrics["graph_path"] == [
+        "route",
+        "recall_memory",
+        "plan",
+        "retrieve",
+    ]
 
     restarted = agent.debug_resume(
         paused.run_id,
@@ -99,3 +104,20 @@ def test_follow_up_uses_session_memory(tmp_path: Path, monkeypatch) -> None:
 
     assert second.session_id == first.session_id
     assert second.metrics["retrieved_chunks"] > 0
+
+
+def test_context_memory_skill_and_reflection_are_observable(tmp_path: Path, monkeypatch) -> None:
+    agent = build_agent(tmp_path, monkeypatch)
+
+    first = agent.ask("分析 Cross-Encoder 变更影响")
+    second = agent.ask("继续分析这个变更的风险", session_id=first.session_id)
+
+    assert first.metrics["selected_skill"] == "change_impact_analysis"
+    assert first.metrics["plan"]["actions"] == ["impact_analysis"]
+    assert first.metrics["react_steps"] == 1
+    assert first.metrics["reflection"]["decision"] == "accept"
+    assert first.metrics["context"]["token_budget"] >= 256
+    assert second.metrics["memory_recall"]
+    assert "episodic" in {
+        item["partition"] for item in second.metrics["memory_recall"]
+    }

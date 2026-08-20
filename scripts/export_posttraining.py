@@ -8,7 +8,12 @@ from pathlib import Path
 from app.agent import KnowledgeAgent
 from app.evaluation import load_cases
 from app.rag_engine import KnowledgeBase
-from app.trajectory_learning import TrajectoryOracle, build_training_record
+from app.trajectory_learning import (
+    TrajectoryOracle,
+    build_preference_pairs,
+    build_sft_example,
+    build_training_record,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -22,6 +27,16 @@ def main() -> None:
         "--output",
         type=Path,
         default=ROOT / "reports" / "posttraining-trajectories.jsonl",
+    )
+    parser.add_argument(
+        "--sft-output",
+        type=Path,
+        default=ROOT / "reports" / "posttraining-sft.jsonl",
+    )
+    parser.add_argument(
+        "--preference-output",
+        type=Path,
+        default=ROOT / "reports" / "posttraining-preferences.jsonl",
     )
     args = parser.parse_args()
 
@@ -40,14 +55,34 @@ def main() -> None:
         records.append(build_training_record(case.query, response, oracle))
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
+    args.sft_output.parent.mkdir(parents=True, exist_ok=True)
+    args.preference_output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(
         "".join(json.dumps(record, ensure_ascii=False) + "\n" for record in records),
+        encoding="utf-8",
+    )
+    sft_examples = [build_sft_example(record) for record in records]
+    args.sft_output.write_text(
+        "".join(json.dumps(record, ensure_ascii=False) + "\n" for record in sft_examples),
+        encoding="utf-8",
+    )
+    preference_pairs = build_preference_pairs(records)
+    args.preference_output.write_text(
+        "".join(json.dumps(record, ensure_ascii=False) + "\n" for record in preference_pairs),
         encoding="utf-8",
     )
     mean_reward = sum(record["reward"]["total"] for record in records) / max(len(records), 1)
     print(
         json.dumps(
-            {"records": len(records), "mean_reward": round(mean_reward, 4), "output": str(args.output)},
+            {
+                "records": len(records),
+                "sft_examples": len(sft_examples),
+                "preference_pairs": len(preference_pairs),
+                "mean_reward": round(mean_reward, 4),
+                "output": str(args.output),
+                "sft_output": str(args.sft_output),
+                "preference_output": str(args.preference_output),
+            },
             ensure_ascii=False,
             indent=2,
         )

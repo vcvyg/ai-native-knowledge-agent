@@ -2,28 +2,32 @@ from __future__ import annotations
 
 import base64
 import io
+import json
 import os
+import queue
 import threading
 import time
 import zipfile
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any, AsyncIterator
+from typing import Any, AsyncIterator, Iterator
 from xml.etree import ElementTree as ET
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from .agent import AgentResponse, DebugResponse, KnowledgeAgent, ToolCall
+from .agent import AgentResponse, DebugResponse, KnowledgeAgent, ToolCall, serialize_graph_event
 from .document_store import normalize_content, resolve_document_target
 from .rag_engine import KnowledgeBase
+from .training_dashboard import load_training_dashboard
 
 ROOT = Path(__file__).resolve().parents[1]
 DATA_DIR = ROOT / "data" / "knowledge_base"
 WEB_DIR = ROOT / "web"
+REPORTS_DIR = ROOT / "reports"
 
 MAX_UPLOAD_BYTES = 20 * 1024 * 1024  # decoded payload cap for uploads
 
@@ -58,6 +62,15 @@ class DocumentUploadRequest(BaseModel):
     filename: str = Field(..., min_length=1, max_length=180)
     content_base64: str = Field(..., min_length=8, max_length=30_000_000)
     title: str | None = Field(default=None, max_length=120)
+
+
+class RestoreDocumentRequest(BaseModel):
+    source: str = Field(..., min_length=1, max_length=180)
+
+
+class MemoryImportRequest(BaseModel):
+    source: str = Field(..., min_length=1, max_length=120)
+    records: list[dict[str, Any]] = Field(..., min_length=1, max_length=500)
 
 
 def cors_origins() -> list[str]:
@@ -110,9 +123,9 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
 
 
 app = FastAPI(
-    title="Engineering Change Intelligence Agent",
+    title="RepoPilot",
     description="Evidence-grounded repository change analysis and incident diagnosis agent.",
-    version="0.5.0",
+    version="0.6.0",
     lifespan=lifespan,
 )
 
@@ -149,7 +162,7 @@ def index() -> FileResponse:
 def health() -> dict[str, Any]:
     return {
         "status": "ok" if kb is not None else "initializing",
-        "service": "engineering-change-intelligence-agent",
+        "service": "repopilot",
         "time": time.time(),
         "kb": kb.stats() if kb is not None else None,
         "error": init_error if kb is None else None,
@@ -166,9 +179,40 @@ def workflow() -> dict[str, Any]:
     return require_agent().workflow_spec()
 
 
+@app.get("/api/training/dashboard")
+def training_dashboard() -> dict[str, Any]:
+    return load_training_dashboard(REPORTS_DIR)
+
+
+@app.get("/api/skills")
+def skills() -> list[dict[str, Any]]:
+    return require_agent().skills.list()
+
+
+@app.get("/api/tools")
+def tools() -> list[dict[str, Any]]:
+    return require_agent().tool_registry.definitions()
+
+
+@app.get("/api/memory/stats")
+def memory_stats() -> dict[str, int]:
+    return require_agent().memory.stats()
+
+
+@app.post("/api/memory/import")
+def import_memory(payload: MemoryImportRequest) -> dict[str, Any]:
+    result = require_agent().memory.import_records(payload.records, source=payload.source)
+    return {"success": True, **result, "memory": require_agent().memory.stats()}
+
+
 @app.get("/api/kb/documents")
 def kb_documents() -> list[dict[str, Any]]:
     return require_kb().documents()
+
+
+@app.get("/api/kb/deleted-documents")
+def kb_deleted_documents() -> list[dict[str, str]]:
+    return require_kb().deleted_documents()
 
 
 @app.post("/api/kb/reload")
@@ -194,6 +238,25 @@ def add_document(payload: DocumentRequest) -> dict[str, Any]:
         "idempotent": resolved.already_exists,
         "document": target.name,
         "content_digest": resolved.digest,
+        "kb": active_kb.stats(),
+    }
+
+
+@app.put("/api/kb/documents/{doc_id}")
+def update_document(doc_id: str, payload: DocumentRequest) -> dict[str, Any]:
+    """Update a stable document in place so unchanged chunks reuse embeddings."""
+
+    active_kb = require_kb()
+    target = active_kb.document_path(doc_id)
+    if target is None:
+        raise HTTPException(status_code=404, detail="资料不存在")
+    content = normalize_content(payload.content)
+    target.write_text(f"# {payload.title.strip()}\n\n{content}\n", encoding="utf-8")
+    active_kb.load()
+    return {
+        "success": True,
+        "updated": target.name,
+        "doc_id": doc_id,
         "kb": active_kb.stats(),
     }
 
@@ -234,17 +297,24 @@ def upload_document(payload: DocumentUploadRequest) -> dict[str, Any]:
 @app.delete("/api/kb/documents/{doc_id}")
 def delete_document(doc_id: str) -> dict[str, Any]:
     active_kb = require_kb()
-    target = active_kb.document_path(doc_id)
+    target = active_kb.soft_delete_document(doc_id)
     if target is None:
         raise HTTPException(status_code=404, detail="资料不存在")
-    try:
-        target.relative_to(DATA_DIR)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail="非法资料路径") from exc
+    return {
+        "success": True,
+        "soft_deleted": target.name,
+        "recoverable": True,
+        "kb": active_kb.stats(),
+    }
 
-    target.unlink()
-    active_kb.load()
-    return {"success": True, "deleted": target.name, "kb": active_kb.stats()}
+
+@app.post("/api/kb/restore")
+def restore_document(payload: RestoreDocumentRequest) -> dict[str, Any]:
+    active_kb = require_kb()
+    target = active_kb.restore_document(payload.source)
+    if target is None:
+        raise HTTPException(status_code=404, detail="已删除资料不存在或目标文件已存在")
+    return {"success": True, "restored": target.name, "kb": active_kb.stats()}
 
 
 @app.post("/api/ask")
@@ -252,6 +322,47 @@ def ask(payload: AskRequest) -> dict[str, Any]:
     active_agent = require_agent()
     response = active_agent.ask(payload.query, session_id=payload.session_id, top_k=payload.top_k)
     return serialize_agent_response(response)
+
+
+@app.post("/api/ask/stream")
+def ask_stream(payload: AskRequest) -> StreamingResponse:
+    """Stream graph state changes as SSE while the synchronous Agent runs."""
+
+    active_agent = require_agent()
+
+    def generate() -> Iterator[str]:
+        events: queue.Queue[dict[str, Any] | None] = queue.Queue()
+
+        def publish_graph_event(event) -> None:
+            events.put({"type": "graph_event", "event": serialize_graph_event(event)})
+
+        def run() -> None:
+            try:
+                response = active_agent.ask(
+                    payload.query,
+                    session_id=payload.session_id,
+                    top_k=payload.top_k,
+                    event_sink=publish_graph_event,
+                )
+                events.put({"type": "final", "response": serialize_agent_response(response)})
+            except Exception as exc:
+                events.put({"type": "error", "error": f"{type(exc).__name__}: {exc}"})
+            finally:
+                events.put(None)
+
+        threading.Thread(target=run, name="agent-sse-run", daemon=True).start()
+        while True:
+            item = events.get()
+            if item is None:
+                break
+            event_type = str(item["type"])
+            yield f"event: {event_type}\ndata: {json.dumps(item, ensure_ascii=False)}\n\n"
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 @app.post("/api/debug/run")

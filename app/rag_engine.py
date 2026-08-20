@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
 import threading
 import time
 from dataclasses import asdict, dataclass
@@ -11,6 +12,7 @@ from typing import Any
 
 import numpy as np
 
+from .context_engine import ContextBundle, ContextPacker, EvidenceGraph
 from .embeddings import EmbeddingProvider, build_embedding_provider
 from .rerankers import build_reranker
 
@@ -234,6 +236,7 @@ class KnowledgeBase:
         self._lock = threading.Lock()
         self._stats_cache: dict[str, Any] | None = None
         self._file_snapshots: dict[str, str] = {}
+        self.evidence_graph = EvidenceGraph([])
         self._ready = False
         self.load()
 
@@ -265,6 +268,8 @@ class KnowledgeBase:
         for file_path in sorted(self.data_dir.rglob("*")):
             if file_path.suffix.lower() not in SUPPORTED_EXTENSIONS:
                 continue
+            if any(part.startswith(".") for part in file_path.relative_to(self.data_dir).parts):
+                continue
             files[str(file_path)] = _file_digest(file_path)
 
         changed_paths = {
@@ -275,17 +280,15 @@ class KnowledgeBase:
             return  # nothing changed; keep the existing index untouched
 
         chunks: list[Chunk] = []
-        changed_doc_ids: set[str] = set()
         for path in sorted(files):
             text = Path(path).read_text(encoding="utf-8", errors="ignore")
             file_chunks = chunk_document(Path(path), text)
-            if path in changed_paths:
-                changed_doc_ids.update(chunk.doc_id for chunk in file_chunks)
             chunks.extend(file_chunks)
 
-        # Chunks from untouched documents keep their previous embeddings; only
-        # the delta (new or changed documents) is re-encoded.
-        reuse_ids = {chunk.id for chunk in chunks if chunk.doc_id not in changed_doc_ids}
+        # Chunk ids include normalized content, so unchanged chunks from a
+        # modified document can safely keep their existing embedding row.
+        previous_ids = {chunk.id for chunk in self.chunks}
+        reuse_ids = {chunk.id for chunk in chunks if chunk.id in previous_ids}
         index_views = _chunk_index_views(chunks)
         try:
             self.vector_backend_error = None
@@ -297,6 +300,7 @@ class KnowledgeBase:
             self.vector_store = DenseVectorStore(self.embedding_provider)
             self.vector_store.build(chunks, index_views)
         self.chunks = chunks
+        self.evidence_graph = EvidenceGraph(chunks)
         self._file_snapshots = files
         self.last_loaded_at = time.time()
         self._stats_cache = None
@@ -315,6 +319,7 @@ class KnowledgeBase:
                     "last_loaded_at": self.last_loaded_at,
                     "embedding_model": self.embedding_provider.name,
                     "embedding_dimensions": self.embedding_provider.dimensions,
+                    "evidence_relations": len(self.evidence_graph.relations),
                 }
             # Runtime state is always read live so a mid-flight reranker
             # fallback is still reflected even when the doc stats are cached.
@@ -357,9 +362,48 @@ class KnowledgeBase:
         for file_path in sorted(self.data_dir.rglob("*")):
             if file_path.suffix.lower() not in SUPPORTED_EXTENSIONS:
                 continue
+            if any(part.startswith(".") for part in file_path.relative_to(self.data_dir).parts):
+                continue
             if stable_doc_id(file_path) == doc_id:
                 return file_path
         return None
+
+    def soft_delete_document(self, doc_id: str) -> Path | None:
+        """Move a document to the recoverable tombstone area and rebuild the delta."""
+
+        path = self.document_path(doc_id)
+        if path is None:
+            return None
+        trash_dir = self.data_dir / ".trash"
+        trash_dir.mkdir(parents=True, exist_ok=True)
+        target = trash_dir / path.name
+        if target.exists():
+            target = trash_dir / f"{path.stem}-{int(time.time())}{path.suffix}"
+        shutil.move(str(path), str(target))
+        self.load()
+        return target
+
+    def deleted_documents(self) -> list[dict[str, str]]:
+        trash_dir = self.data_dir / ".trash"
+        if not trash_dir.exists():
+            return []
+        return [
+            {"doc_id": stable_doc_id(path), "source": path.name, "path": str(path)}
+            for path in sorted(trash_dir.iterdir())
+            if path.suffix.lower() in SUPPORTED_EXTENSIONS
+        ]
+
+    def restore_document(self, source: str) -> Path | None:
+        trash_dir = self.data_dir / ".trash"
+        path = trash_dir / Path(source).name
+        if not path.exists() or path.suffix.lower() not in SUPPORTED_EXTENSIONS:
+            return None
+        target = self.data_dir / path.name
+        if target.exists():
+            return None
+        shutil.move(str(path), str(target))
+        self.load()
+        return target
 
     def search(self, query: str, top_k: int = 6) -> list[SearchHit]:
         # Snapshot the mutable index under the lock so a concurrent reload
@@ -417,6 +461,21 @@ class KnowledgeBase:
         hits.sort(key=lambda h: h.score, reverse=True)
         return self.reranker.rerank(query, hits[: max(top_k * 3, 10)])[:top_k]
 
+    def build_context(
+        self,
+        query: str,
+        *,
+        top_k: int = 6,
+        token_budget: int = 1800,
+        graph_expansion: int = 2,
+    ) -> ContextBundle:
+        """Run hybrid retrieval, bounded graph expansion and context packing."""
+
+        initial = self.search(query, top_k=max(top_k, graph_expansion + top_k))
+        expanded, relations = self.evidence_graph.expand(initial, limit=graph_expansion)
+        packer = ContextPacker(token_budget=token_budget)
+        return packer.pack(expanded, relations)
+
 
 @dataclass
 class _IndexView:
@@ -437,20 +496,24 @@ def chunk_document(file_path: Path, text: str) -> list[Chunk]:
     sections = split_sections(normalized)
     chunks: list[Chunk] = []
 
-    chunk_no = 0
+    occurrences: dict[str, int] = {}
     for section_title, section_text in sections:
         for piece in split_to_chunks(section_text):
             if len(piece.strip()) < 20:
                 continue
-            chunk_no += 1
+            normalized_piece = piece.strip()
+            digest = sha1(
+                f"{section_title}\n{normalized_piece}".encode("utf-8")
+            ).hexdigest()[:12]
+            occurrences[digest] = occurrences.get(digest, 0) + 1
             chunks.append(
                 Chunk(
-                    id=f"{doc_id}-{chunk_no:03d}",
+                    id=f"{doc_id}-{digest}-{occurrences[digest]}",
                     doc_id=doc_id,
                     title=title,
                     section=section_title or title,
                     source=file_path.name,
-                    text=piece.strip(),
+                    text=normalized_piece,
                 )
             )
     return chunks

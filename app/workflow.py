@@ -17,8 +17,16 @@ class AgentState:
     normalized_query: str
     top_k: int
     trace: list[Any]
+    session_id: str = ""
     intent: str = ""
     tools: list[str] = field(default_factory=list)
+    selected_skill: str = ""
+    plan: dict[str, Any] = field(default_factory=dict)
+    memory_hits: list[dict[str, Any]] = field(default_factory=list)
+    context_metrics: dict[str, Any] = field(default_factory=dict)
+    observations: list[dict[str, Any]] = field(default_factory=list)
+    reflection: dict[str, Any] = field(default_factory=dict)
+    react_steps: int = 0
     router_confidence: float = 0.0
     retrieval_query: str = ""
     retrieval_attempts: int = 0
@@ -50,6 +58,7 @@ class GraphRun:
 
 Node = Callable[[AgentState], None]
 Router = Callable[[AgentState], str]
+EventSink = Callable[[GraphEvent], None]
 
 
 def _constant_router(next_node: str) -> Router:
@@ -97,6 +106,7 @@ class StateGraph:
         prior_events: list[GraphEvent] | None = None,
         breakpoints: set[str] | None = None,
         skip_breakpoint_once: str | None = None,
+        event_sink: EventSink | None = None,
     ) -> GraphRun:
         if not self._entrypoint:
             raise RuntimeError("workflow entrypoint is not configured")
@@ -112,16 +122,17 @@ class StateGraph:
 
         for _ in range(remaining):
             if current in active_breakpoints and current != skip_breakpoint_once:
-                events.append(
-                    GraphEvent(
-                        sequence=len(events) + 1,
-                        node=current,
-                        status="paused",
-                        latency_ms=0,
-                        next_node=current,
-                        detail={"reason": "breakpoint"},
-                    )
+                event = GraphEvent(
+                    sequence=len(events) + 1,
+                    node=current,
+                    status="paused",
+                    latency_ms=0,
+                    next_node=current,
+                    detail={"reason": "breakpoint"},
                 )
+                events.append(event)
+                if event_sink:
+                    event_sink(event)
                 return GraphRun(
                     path=path,
                     transitions=len(path),
@@ -138,16 +149,17 @@ class StateGraph:
             try:
                 node(state)
             except Exception as exc:
-                events.append(
-                    GraphEvent(
-                        sequence=len(events) + 1,
-                        node=current,
-                        status="failed",
-                        latency_ms=int((time.perf_counter() - started) * 1000),
-                        next_node=None,
-                        detail={"error": f"{type(exc).__name__}: {exc}"},
-                    )
+                event = GraphEvent(
+                    sequence=len(events) + 1,
+                    node=current,
+                    status="failed",
+                    latency_ms=int((time.perf_counter() - started) * 1000),
+                    next_node=None,
+                    detail={"error": f"{type(exc).__name__}: {exc}"},
                 )
+                events.append(event)
+                if event_sink:
+                    event_sink(event)
                 raise
 
             router = self._routers.get(current)
@@ -159,20 +171,25 @@ class StateGraph:
                 status = "retry"
             elif current == "verify_evidence" and state.evidence_quality == "low":
                 status = "rejected"
-            events.append(
-                GraphEvent(
-                    sequence=len(events) + 1,
-                    node=current,
-                    status=status,
-                    latency_ms=int((time.perf_counter() - started) * 1000),
-                    next_node=None if next_node == END else next_node,
-                    detail={
-                        "attempt": state.retrieval_attempts,
-                        "evidence_quality": state.evidence_quality,
-                        "stop_reason": state.stop_reason,
-                    },
-                )
+            elif current == "reflect" and state.reflection.get("decision") == "revise":
+                status = "retry"
+            event = GraphEvent(
+                sequence=len(events) + 1,
+                node=current,
+                status=status,
+                latency_ms=int((time.perf_counter() - started) * 1000),
+                next_node=None if next_node == END else next_node,
+                detail={
+                    "attempt": state.retrieval_attempts,
+                    "evidence_quality": state.evidence_quality,
+                    "stop_reason": state.stop_reason,
+                    "selected_skill": state.selected_skill,
+                    "react_steps": state.react_steps,
+                },
             )
+            events.append(event)
+            if event_sink:
+                event_sink(event)
             current = next_node
             if current == END:
                 return GraphRun(

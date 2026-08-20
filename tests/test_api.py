@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import io
+import json
 import zipfile
 from pathlib import Path
 
@@ -62,6 +63,33 @@ def test_kb_stats_documents_workflow(api: TestClient) -> None:
     workflow = api.get("/api/workflow").json()
     assert workflow["entrypoint"] == "route"
     assert "verify_evidence" in workflow["nodes"]
+    assert "recall_memory" in workflow["nodes"]
+    assert "reflect" in workflow["nodes"]
+    assert api.get("/api/skills").json()
+    assert api.get("/api/tools").json()
+
+
+def test_training_dashboard_endpoint(api: TestClient, tmp_path: Path, monkeypatch) -> None:
+    reports = tmp_path / "reports"
+    reports.mkdir()
+    (reports / "evaluation-results.json").write_text(
+        json.dumps({"summary": {"cases": 1, "passed": 1, "pass_rate": 1.0}}),
+        encoding="utf-8",
+    )
+    (reports / "posttraining-trajectories.jsonl").write_text(
+        json.dumps({"instance_id": "run-1", "trajectory": {}, "reward": {"total": 1.0}}) + "\n",
+        encoding="utf-8",
+    )
+    (reports / "posttraining-sft.jsonl").write_text("{}\n", encoding="utf-8")
+    (reports / "posttraining-preferences.jsonl").write_text("", encoding="utf-8")
+    monkeypatch.setattr(main_mod, "REPORTS_DIR", reports)
+
+    response = api.get("/api/training/dashboard")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "data_ready"
+    assert payload["boundary"]["actual_training_run"] is False
 
 
 def test_ask_returns_grounded_response(api: TestClient) -> None:
@@ -72,6 +100,20 @@ def test_ask_returns_grounded_response(api: TestClient) -> None:
     assert payload["intent"]
     assert payload["metrics"]["retrieval_attempts"] >= 1
     assert payload["metrics"]["graph_path"]
+
+
+def test_ask_stream_emits_live_graph_events_and_final_response(api: TestClient) -> None:
+    response = api.post(
+        "/api/ask/stream",
+        json={"query": "什么是 RAG 检索增强生成？", "top_k": 6},
+    )
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/event-stream")
+    assert "event: graph_event" in response.text
+    assert '"node": "route"' in response.text
+    assert '"node": "reflect"' in response.text
+    assert "event: final" in response.text
 
 
 def test_ask_validates_query_length(api: TestClient) -> None:
@@ -160,12 +202,51 @@ def test_add_and_delete_document(api: TestClient) -> None:
     )
     assert duplicated.json()["idempotent"] is True
 
+    updated = api.put(
+        f"/api/kb/documents/{doc_id}",
+        json={
+            "title": "新文档（已更新）",
+            "content": "这是原位更新后的文档内容，稳定 doc_id 不变，只重建发生变化的 chunk。",
+        },
+    )
+    assert updated.status_code == 200
+    assert updated.json()["doc_id"] == doc_id
+    assert any(item["doc_id"] == doc_id for item in api.get("/api/kb/documents").json())
+
     deleted = api.delete(f"/api/kb/documents/{doc_id}")
     assert deleted.status_code == 200
-    assert deleted.json()["deleted"]
+    assert deleted.json()["soft_deleted"]
+    assert deleted.json()["recoverable"] is True
+    assert api.get("/api/kb/deleted-documents").json()
 
-    missing = api.delete(f"/api/kb/documents/{doc_id}")
-    assert missing.status_code == 404
+    restored = api.post("/api/kb/restore", json={"source": deleted.json()["soft_deleted"]})
+    assert restored.status_code == 200
+    assert restored.json()["restored"] == deleted.json()["soft_deleted"]
+
+    deleted_again = api.delete(f"/api/kb/documents/{doc_id}")
+    assert deleted_again.status_code == 200
+
+
+def test_memory_import_endpoint_is_idempotent(api: TestClient) -> None:
+    payload = {
+        "source": "hebb-mind",
+        "records": [
+            {
+                "id": "incident-1",
+                "partition": "episodic",
+                "content": "Embedding 下载超时后检查网络代理和模型缓存。",
+                "task_type": "incident_diagnosis",
+            }
+        ],
+    }
+
+    first = api.post("/api/memory/import", json=payload)
+    second = api.post("/api/memory/import", json=payload)
+
+    assert first.status_code == 200
+    assert first.json()["created"] == 1
+    assert second.json()["duplicates"] == 1
+    assert api.get("/api/memory/stats").json()["episodic"] >= 1
 
 
 def test_debug_run_resume_cancel_flow(api: TestClient) -> None:

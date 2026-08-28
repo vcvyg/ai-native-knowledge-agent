@@ -55,3 +55,14 @@ def build_langgraph_workflow(
     graph.add_edge("synthesize", END)
 
     return graph.compile()
+
+
+def run_langgraph_agent(graph, query: str) -> dict[str, Any]:
+    """Execute the compiled graph with a minimal initial state.
+
+    This wrapper makes the adapter directly callable while keeping existing
+    RepoPilot workflow implementations independent from LangGraph.
+    """
+
+    result = graph.invoke({"query": query})
+    return dict(result)

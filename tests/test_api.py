@@ -61,6 +61,8 @@ def test_kb_stats_documents_workflow(api: TestClient) -> None:
     docs = api.get("/api/kb/documents").json()
     assert docs and docs[0]["title"] == "检索服务架构"
     workflow = api.get("/api/workflow").json()
+    assert workflow["framework"] == "langgraph"
+    assert workflow["checkpointing"] == "langgraph_in_memory"
     assert workflow["entrypoint"] == "route"
     assert "verify_evidence" in workflow["nodes"]
     assert "recall_memory" in workflow["nodes"]

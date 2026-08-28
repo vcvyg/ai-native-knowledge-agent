@@ -2,7 +2,7 @@
 
 一个面向软件仓库的工程变更分析与故障诊断 Agent。它把架构文档、PR 说明、日志、Runbook 和评测结果组织成可检索证据，并围绕变更影响、PR 风险、故障假设、验证计划和回滚步骤给出有边界的工程结论。
 
-系统核心不是普通问答，而是一条可规划、可执行、可验证、可学习的 Agent 控制流：外层 State Graph 管理流程边界，内层 Plan → Action → Observation → Reflection 负责动态工具决策；Verification Loop 在证据不足时有界重试，并保留断点、继续、编辑后重跑与终止能力。
+系统核心不是普通问答，而是一条可规划、可执行、可验证、可学习的 Agent 控制流：外层由 **LangGraph StateGraph** 管理流程边界、条件路由与 Checkpoint，内层 Plan → Action → Observation → Reflection 负责动态工具决策；Verification Loop 在证据不足时有界重试，并保留断点、继续、编辑后重跑与终止能力。
 
 ## 主要能力
 
@@ -15,6 +15,7 @@
 - **生产安全边界**：写操作进入 Human Approval Gate；Tool Registry 提供 idempotency key、执行状态与补偿 rollback 回调，避免重复副作用。
 - **证据门控**：检查原问题与命中材料是否有直接领域信号；低证据时不调用外部 LLM。
 - **有界恢复**：Query Rewrite、检索预算和全局图转换上限共同防止无界循环。
+- **LangGraph 原生编排**：9 个业务节点直接注册到 LangGraph，条件边负责证据重试与 ReAct 循环，`InMemorySaver` + `interrupt/Command` 负责断点和恢复，不再维护第二套自研图执行器。
 - **执行轨迹**：Graph Path、Tool Trace、检索次数、实际 Reranker、证据质量和停止原因均可观察。
 - **实时运行事件**：`/api/ask/stream` 通过 SSE 在节点完成时推送 Route、Retrieve、Tool、Reflection 与 Final 事件，而不是等整次请求结束后一次性返回。
 - **可视化调试**：节点断点、内存 Checkpoint、继续、编辑查询后从 Route 重启、终止与清理。
@@ -53,7 +54,7 @@ Debug: breakpoint → checkpoint → resume / edit and restart / cancel
 
 - Backend：Python、FastAPI、Pydantic、Uvicorn
 - Retrieval：SentenceTransformers、BGE、Dense Cosine Search、Chroma、Cross-Encoder
-- Agent：State Graph、ReAct、Planning / Reflection、Verification Loop、Skill、Native/MCP Tool Registry
+- Agent：LangGraph、StateGraph、Checkpoint / Interrupt、ReAct、Planning / Reflection、Verification Loop、Skill、Native/MCP Tool Registry
 - Memory：Working、Episodic、Semantic、Procedural、幂等 Memory Import
 - Safety：Human Approval、Idempotency、Rollback、Bounded Retry / Stop Reason
 - LLM：OpenAI-compatible Chat API Adapter（可选）
@@ -148,7 +149,7 @@ POST   /api/debug/resume
 DELETE /api/debug/runs/{run_id}
 ```
 
-`/api/ask` 返回 `answer`、`intent`、`citations`、`trace` 和 `metrics`。调试接口在节点执行前暂停并保留 Checkpoint；完成或取消后清理。
+`/api/ask` 返回 `answer`、`intent`、`citations`、`trace` 和 `metrics`；`/api/workflow` 会明确返回 `framework=langgraph`。调试接口通过 LangGraph interrupt 在节点执行前暂停并保留 Checkpoint，使用相同 thread 恢复；完成或取消后清理。
 
 ## 测试与评估
 

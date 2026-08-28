@@ -51,6 +51,7 @@ def test_state_graph_pauses_and_resumes_at_breakpoint() -> None:
         prior_events=paused.events,
         breakpoints={"second"},
         skip_breakpoint_once=paused.next_node,
+        thread_id=paused.thread_id,
     )
 
     assert paused.status == "paused"
@@ -58,3 +59,9 @@ def test_state_graph_pauses_and_resumes_at_breakpoint() -> None:
     assert resumed.status == "completed"
     assert resumed.path == ["first", "second"]
     assert state.answer == "done"
+
+
+def test_state_graph_is_backed_by_langgraph() -> None:
+    graph = StateGraph()
+
+    assert graph.framework == "langgraph"

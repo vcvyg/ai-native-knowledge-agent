@@ -23,7 +23,7 @@ flowchart TD
     K --> L["Answer + Citations + Episodic Memory"]
 ```
 
-`AgentState` 在节点之间传递原始问题、当前检索查询、意图、Skill、Plan、Memory hits、packed context、Tool Observation、Reflection、尝试次数、证据质量、答案和停止原因。`StateGraph` 同时限制 retrieval、ReAct step 和全局 transition，防止错误路由造成无界循环。
+`AgentState` 在节点之间传递原始问题、当前检索查询、意图、Skill、Plan、Memory hits、packed context、Tool Observation、Reflection、尝试次数、证据质量、答案和停止原因。业务节点直接注册到 LangGraph `StateGraph`；条件边表达 evidence retry 与 ReAct loop，LangGraph recursion limit 再提供全局兜底，防止错误路由造成无界循环。
 
 ## Context Engine
 
@@ -44,7 +44,7 @@ Tool Registry 对 Native 与 MCP 使用同一执行协议。MCP 客户端执行 
 
 ## Breakpoint and Checkpoint
 
-调试运行可以在任意节点执行前设置断点。`StateGraph.run` 返回 `paused`、待执行节点、历史路径和节点事件；服务端用内存 Checkpoint 保存 `AgentState`，恢复时跳过当前断点一次并继续执行。暂停期间有三种操作：
+调试运行可以在任意节点执行前设置断点。每个节点入口根据本次调试配置调用 LangGraph `interrupt()`；`InMemorySaver` 按 thread ID 保存状态、路径和节点事件，恢复时使用 `Command(resume=...)` 从同一 checkpoint 继续。暂停期间有三种操作：
 
 - Resume：保留当前状态继续，循环再次经过同一节点时仍会命中断点。
 - Edit and Restart：替换问题并从 Route 重新计算，避免把旧意图或旧证据带入新问题。
@@ -52,7 +52,7 @@ Tool Registry 对 Native 与 MCP 使用同一执行协议。MCP 客户端执行 
 
 前端 SVG 执行图根据 `graph_events` 区分 completed、warning、retry、failed 和 paused，并将工具事件按实际顺序展开。
 
-普通 `/api/ask` 返回完整结果；`/api/ask/stream` 在后台线程运行同一 State Graph，并通过 SSE event sink 在每个节点完成、失败或暂停时立即推送 `graph_event`，最后推送 `final`。这里选择 SSE 是因为运行状态是服务端到客户端的单向事件流；不会为了复用 WebSocket 关键词引入不必要的双向协议。
+普通 `/api/ask` 返回完整结果；`/api/ask/stream` 在后台线程消费同一 LangGraph 的 `updates` stream，并通过 SSE 在每个节点完成、失败或暂停时立即推送 `graph_event`，最后推送 `final`。这里选择 SSE 是因为运行状态是服务端到客户端的单向事件流；不会为了复用 WebSocket 关键词引入不必要的双向协议。
 
 ## Verification Loop
 

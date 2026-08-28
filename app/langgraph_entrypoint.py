@@ -1,7 +1,8 @@
 """LangGraph execution entrypoint for RepoPilot.
 
-Keeps existing agent business logic intact while exposing a LangGraph based
-runtime boundary.
+Provides the LangGraph orchestration boundary while keeping existing business
+nodes injectable. The existing agent modules can migrate incrementally by
+passing their node functions here.
 """
 
 from typing import Any, Callable
@@ -16,6 +17,7 @@ class RepoPilotRuntimeState(TypedDict, total=False):
     observations: list[Any]
     answer: str
     reflection: dict[str, Any]
+    trace: list[dict[str, Any]]
 
 
 Node = Callable[[RepoPilotRuntimeState], RepoPilotRuntimeState]
@@ -29,14 +31,22 @@ def build_repopilot_graph(
     reflect: Node,
     answer: Node,
 ):
+    """Build RepoPilot's LangGraph workflow.
+
+    Nodes remain injected so existing retrieval/tools/memory implementations
+    can be reused without rewriting them into LangChain abstractions.
+    """
     graph = StateGraph(RepoPilotRuntimeState)
 
-    graph.add_node("planner", planner)
-    graph.add_node("retrieve", retrieve)
-    graph.add_node("verify", verify)
-    graph.add_node("execute", execute)
-    graph.add_node("reflect", reflect)
-    graph.add_node("answer", answer)
+    for name, node in {
+        "planner": planner,
+        "retrieve": retrieve,
+        "verify": verify,
+        "execute": execute,
+        "reflect": reflect,
+        "answer": answer,
+    }.items():
+        graph.add_node(name, node)
 
     graph.set_entry_point("planner")
     graph.add_edge("planner", "retrieve")
@@ -45,6 +55,7 @@ def build_repopilot_graph(
     graph.add_conditional_edges(
         "verify",
         lambda state: "execute" if state.get("evidence") else "retrieve",
+        {"execute": "execute", "retrieve": "retrieve"},
     )
 
     graph.add_edge("execute", "reflect")
@@ -53,11 +64,14 @@ def build_repopilot_graph(
         lambda state: "answer"
         if state.get("reflection", {}).get("finished")
         else "execute",
+        {"answer": "answer", "execute": "execute"},
     )
 
     graph.add_edge("answer", END)
     return graph.compile()
 
 
-def run(graph, query: str) -> dict[str, Any]:
-    return dict(graph.invoke({"query": query}))
+def run(graph, query: str, **kwargs: Any) -> dict[str, Any]:
+    """Execute a compiled RepoPilot LangGraph workflow."""
+    payload: RepoPilotRuntimeState = {"query": query, **kwargs}
+    return dict(graph.invoke(payload))

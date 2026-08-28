@@ -325,6 +325,9 @@ class KnowledgeAgent:
 
     def workflow_spec(self) -> dict[str, Any]:
         return {
+            "framework": self.workflow.framework,
+            "checkpointing": "langgraph_in_memory",
+            "interrupts": "langgraph_dynamic",
             "entrypoint": "route",
             "nodes": [
                 "route",
@@ -374,7 +377,9 @@ class KnowledgeAgent:
         sid = self.memory.ensure(session_id)
         state = self._new_state(query, sid, top_k)
         graph_run = self.workflow.run(state, event_sink=event_sink)
-        return self._build_response(sid, state, graph_run, started, record_memory=True)
+        response = self._build_response(sid, state, graph_run, started, record_memory=True)
+        self.workflow.cancel(graph_run.thread_id)
+        return response
 
     def debug_start(
         self,
@@ -419,6 +424,7 @@ class KnowledgeAgent:
         next_query = (query or checkpoint.query).strip()
 
         if restart:
+            self.workflow.cancel(checkpoint.run.thread_id)
             state = self._new_state(next_query, checkpoint.session_id, checkpoint.top_k)
             state.trace.append(
                 ToolCall(
@@ -440,6 +446,7 @@ class KnowledgeAgent:
                 prior_events=checkpoint.run.events,
                 breakpoints=active_breakpoints,
                 skip_breakpoint_once=checkpoint.run.next_node,
+                thread_id=checkpoint.run.thread_id,
             )
 
         return self._finish_debug_step(
@@ -455,7 +462,11 @@ class KnowledgeAgent:
 
     def cancel_debug(self, run_id: str) -> bool:
         with self._debug_lock:
-            return self._debug_runs.pop(run_id, None) is not None
+            checkpoint = self._debug_runs.pop(run_id, None)
+        if checkpoint is None:
+            return False
+        self.workflow.cancel(checkpoint.run.thread_id)
+        return True
 
     def _new_state(self, query: str, session_id: str, top_k: int) -> AgentState:
         normalized_query = self._resolve_follow_up(query, session_id)
@@ -495,6 +506,7 @@ class KnowledgeAgent:
             record_memory=completed,
         )
         if completed:
+            self.workflow.cancel(graph_run.thread_id)
             with self._debug_lock:
                 self._debug_runs.pop(run_id, None)
         else:
